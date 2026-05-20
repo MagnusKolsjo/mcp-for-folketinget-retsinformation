@@ -1,0 +1,11 @@
+mcp
+python-dotenv
+psycopg2-binary
+pgvector
+httpx
+curl-cffi
+pymupdf4llm
+sentence-transformers
+torch
+openai
+lxml
