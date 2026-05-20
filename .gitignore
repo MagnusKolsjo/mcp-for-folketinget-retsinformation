@@ -1,0 +1,15 @@
+.env
+*.db
+*.db-journal
+pdf_cache/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+embeddings/
+*.db-wal
+*.db-shm
+*.log
+06_backfill_relationer.py
+07_backfill_datum.py
