@@ -308,6 +308,71 @@ def semantisk_sok(sokterm: str, limit: int = 20) -> list[dict]:
         return [dict(zip(kolumner, rad)) for rad in cur.fetchall()]
 
 
+def semantisk_sok_i_dokument(dok_id: int, fraga: str, limit: int = 5) -> dict:
+    """
+    Semantisk sökning via pgvector inom ett enskilt cachat dokument.
+
+    Returnerar ett dict med dokumentmetadata + topp-N chunk-träffar sorterade
+    efter cosinus-avstånd. Om dokumentet inte finns eller saknar chunks
+    returneras ett fel-fält. Kräver PostgreSQL med pgvector — SQLite-läge
+    har inga embeddings och stöds inte.
+    """
+    if not db._ar_postgres():
+        return {"fel": "Semantisk sökning kräver PostgreSQL med pgvector — SQLite-läge stöds inte."}
+
+    p = db._prefix()
+
+    # Verifiera att dokumentet finns och hämta metadata
+    with db._cursor() as cur:
+        cur.execute(
+            f"SELECT id, kalla, beteckning, typ, titel FROM {p}dokument WHERE id = %s",
+            (dok_id,)
+        )
+        rad = cur.fetchone()
+        if not rad:
+            return {"fel": f"Dokument med dok_id={dok_id} hittades inte i databasen."}
+        dok_meta = {
+            "dok_id":     rad[0],
+            "kalla":      rad[1],
+            "beteckning": rad[2],
+            "typ":        rad[3],
+            "titel":      rad[4],
+        }
+
+        # Räkna chunks så svaret blir transparent när dokumentet är litet
+        cur.execute(f"SELECT COUNT(*) FROM {p}chunks WHERE dok_id = %s", (dok_id,))
+        antal_chunks = cur.fetchone()[0]
+
+    if antal_chunks == 0:
+        return {**dok_meta, "antal_chunks": 0,
+                "fel": "Dokumentet har inga chunks — fulltext saknas eller chunkning ej körd."}
+
+    # Generera embedding för frågan och kör vektorsökningen scoped till dok_id
+    vektor = _generera_embeddings([fraga])[0]
+
+    with db._cursor() as cur:
+        cur.execute(
+            f"""SELECT c.chunk_nr, c.text,
+                       (e.vektor <=> %s::vector) AS avstand
+                FROM {p}embeddings e
+                JOIN {p}chunks c ON c.id = e.chunk_id
+                WHERE c.dok_id = %s
+                ORDER BY avstand ASC
+                LIMIT %s""",
+            (str(vektor), dok_id, limit)
+        )
+        kolumner = [desc[0] for desc in cur.description]
+        traffar = [dict(zip(kolumner, rad)) for rad in cur.fetchall()]
+
+    return {
+        **dok_meta,
+        "fraga":         fraga,
+        "antal_chunks":  antal_chunks,
+        "antal_traffar": len(traffar),
+        "traffar":       traffar,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Huvud
 # ---------------------------------------------------------------------------

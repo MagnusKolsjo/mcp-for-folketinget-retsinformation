@@ -36,22 +36,30 @@ logger = logging.getLogger(__name__)
 import db
 import importlib.util as _iutil, pathlib as _pl
 
-# Lazy-import av semantisk_sok från embedding-modulen
-def _importera_semantisk_sok():
-    """Importerar semantisk_sok från 04_chunka_och_embedda.py."""
-    modul_vag = _pl.Path(__file__).parent / "04_chunka_och_embedda.py"
-    spec = _iutil.spec_from_file_location("chunka_embedda", modul_vag)
-    modul = _iutil.module_from_spec(spec)
-    spec.loader.exec_module(modul)
-    return modul.semantisk_sok
+# Lazy-import av hela chunka/embedda-modulen. Filnamnet börjar med en siffra
+# och kan inte importeras direkt — importlib används istället. Modulen laddas
+# en gång och cachas; därefter exponeras enskilda funktioner via wrappers.
+_chunka_modul = None
 
-_semantisk_sok_fn = None
+
+def _hamta_chunka_modul():
+    """Laddar 04_chunka_och_embedda.py och returnerar modulobjektet (lazy)."""
+    global _chunka_modul
+    if _chunka_modul is None:
+        modul_vag = _pl.Path(__file__).parent / "04_chunka_och_embedda.py"
+        spec = _iutil.spec_from_file_location("chunka_embedda", modul_vag)
+        modul = _iutil.module_from_spec(spec)
+        spec.loader.exec_module(modul)
+        _chunka_modul = modul
+    return _chunka_modul
+
 
 def _hamta_semantisk_sok():
-    global _semantisk_sok_fn
-    if _semantisk_sok_fn is None:
-        _semantisk_sok_fn = _importera_semantisk_sok()
-    return _semantisk_sok_fn
+    return _hamta_chunka_modul().semantisk_sok
+
+
+def _hamta_semantisk_sok_i_dokument():
+    return _hamta_chunka_modul().semantisk_sok_i_dokument
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -397,10 +405,11 @@ async def lista_verktyg():
         types.Tool(
             name="dk_sok_semantisk",
             description=(
-                "Semantisk sökning i dansk riksdags- och rättsdata via pgvector (cosinus-likhet). "
+                "Semantisk sökning över hela den danska korpusen via pgvector (cosinus-likhet) — "
+                "returnerar topp-N olika dokument (avduplicerade på dok_id). "
+                "Använd detta verktyg för dokumentupptäckt på begreppsfrågor. "
+                "För sökning inom ett enskilt cachat dokument, använd dk_sok_i_dokument. "
                 "Kräver att 04_chunka_och_embedda.py körts och embeddings finns i databasen. "
-                "Hittar innehållsmässigt liknande dokument även utan exakta sökord — "
-                "bra för begreppsbaserade frågor om dansk politik och lagstiftning. "
                 "Modell: intfloat/multilingual-e5-base (768 dim). "
                 "Termexpansion körs inte här — vektorsökning hittar synonymer via semantisk likhet."
             ),
@@ -418,6 +427,67 @@ async def lista_verktyg():
                     },
                 },
                 "required": ["sokterm"],
+            },
+        ),
+        types.Tool(
+            name="dk_sok_i_dokument",
+            description=(
+                "Semantisk sökning inom ett enskilt cachat dokument via pgvector (cosinus-likhet). "
+                "Returnerar topp-N chunk-träffar sorterade efter relevans, med chunk_nr och text. "
+                "Använd när du behöver hitta specifika passager i ett dokument du redan identifierat "
+                "(t.ex. via dk_sok eller dk_sok_lovgivning). "
+                "dok_id är det interna databas-id:t som returneras av sökverktygen. "
+                "Kräver PostgreSQL med pgvector — SQLite-läge stöds inte. "
+                "Modell: intfloat/multilingual-e5-base (768 dim)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dok_id": {
+                        "type": "integer",
+                        "description": "Internt databas-id för dokumentet (matchar dok_id-fältet i dk_sok-resultat)",
+                    },
+                    "fraga": {
+                        "type": "string",
+                        "description": "Sökfråga på danska (eller svenska/engelska) — formuleras som en mening eller fras för bäst resultat",
+                    },
+                    "max_treff": {
+                        "type": "integer",
+                        "description": "Max antal chunk-träffar att returnera (standard 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["dok_id", "fraga"],
+            },
+        ),
+        types.Tool(
+            name="dk_hamta_aktor",
+            description=(
+                "Hämtar metadata för en eller flera aktörer (ledamöter, ministrar, partier, "
+                "ministerier, utskott, m.fl.) från Folketing ODA via Aktør-entiteten. "
+                "Använd för att översätta aktørid:n från dk_hamta_afstemning till läsbara namn "
+                "och partitillhörighet. "
+                "Ange antingen aktorid (enskilt uppslag) eller aktorider (lista, batch-uppslag — "
+                "rekommenderas vid uppslag av många aktörer från en votering, t.ex. 179 ledamöter). "
+                "Returnerar typeid som anger aktörstyp (vanligast 1=Ministerium, 2=Folketinget, "
+                "3=Udvalg, 4=Folketingsgruppe/parti, 5=Person; andra typer förekommer och returneras "
+                "transparent — den kompletta listan finns i ODA-entiteten /Aktørtype), gruppenavnkort "
+                "(parti) och biografi-fält. "
+                "Anropas live mot ODA — ingen cache."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "aktorid": {
+                        "type": "integer",
+                        "description": "ODA aktørid för enskilt uppslag",
+                    },
+                    "aktorider": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Lista av ODA aktørid:n för batch-uppslag (t.ex. från dk_hamta_afstemning)",
+                    },
+                },
             },
         ),
     ]
@@ -444,6 +514,10 @@ async def anropa_verktyg(namn: str, arguments: dict):
             return await _dk_hamta_afstemning(arguments)
         elif namn == "dk_sok_semantisk":
             return await _dk_sok_semantisk(arguments)
+        elif namn == "dk_sok_i_dokument":
+            return await _dk_sok_i_dokument(arguments)
+        elif namn == "dk_hamta_aktor":
+            return await _dk_hamta_aktor(arguments)
         else:
             return [types.TextContent(type="text", text=f"Okänt verktyg: {namn}")]
     except Exception as e:
@@ -859,6 +933,105 @@ async def _dk_sok_semantisk(args: dict):
         "antal_traffar": len(resultat),
         "traffar": resultat,
     }
+    return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
+
+
+async def _dk_sok_i_dokument(args: dict):
+    dok_id    = int(args["dok_id"])
+    fraga     = args["fraga"]
+    max_treff = int(args.get("max_treff", 5))
+
+    if not db._ar_postgres():
+        return [types.TextContent(
+            type="text",
+            text="Semantisk sökning kräver PostgreSQL med pgvector — SQLite-läge stöds inte."
+        )]
+
+    try:
+        fn = _hamta_semantisk_sok_i_dokument()
+        resultat = fn(dok_id, fraga, limit=max_treff)
+    except Exception as e:
+        logger.error("dk_sok_i_dokument misslyckades: %s", e, exc_info=True)
+        return [types.TextContent(type="text", text=f"Inom-dokument-sökning misslyckades: {e}")]
+
+    # semantisk_sok_i_dokument returnerar metadata + ev. fel-fält som dict
+    return [types.TextContent(type="text", text=json.dumps(resultat, ensure_ascii=False, indent=2))]
+
+
+async def _dk_hamta_aktor(args: dict):
+    aktorid   = args.get("aktorid")
+    aktorider = args.get("aktorider")
+
+    if aktorid is None and not aktorider:
+        return [types.TextContent(
+            type="text",
+            text="Ange antingen aktorid (enskilt uppslag) eller aktorider (lista för batch-uppslag)."
+        )]
+    if aktorid is not None and aktorider:
+        return [types.TextContent(
+            type="text",
+            text="Ange antingen aktorid eller aktorider, inte båda."
+        )]
+
+    if aktorid is not None:
+        ids = [int(aktorid)]
+    else:
+        ids = [int(i) for i in aktorider]
+        if not ids:
+            return [types.TextContent(type="text", text="aktorider är tom — inga id:n att slå upp.")]
+
+    aktorer = []
+    fel = []
+
+    # ODA $filter har URL-längdgränser (~2000 tecken). Batcha i grupper om 50
+    # — "id eq 99999 or " är ~15 tecken, så 50 ger marginal under gränsen.
+    BATCH = 50
+    for start in range(0, len(ids), BATCH):
+        batch = ids[start:start + BATCH]
+        filter_uttryck = " or ".join(f"id eq {aid}" for aid in batch)
+        try:
+            data = _oda_get("Aktør", {"$filter": filter_uttryck, "$top": str(BATCH)})
+        except Exception as e:
+            logger.warning("Aktör-batch %s misslyckades: %s", batch, e)
+            fel.append({"batch": batch, "fel": str(e)})
+            continue
+
+        for rad in data.get("value", []):
+            aktorer.append({
+                "aktørid":          rad.get("id"),
+                "typeid":           rad.get("typeid"),
+                # 1=Ministerium, 2=Folketinget, 3=Udvalg,
+                # 4=Folketingsgruppe (parti), 5=Person
+                "navn":             rad.get("navn"),
+                "fornavn":          rad.get("fornavn"),
+                "efternavn":        rad.get("efternavn"),
+                "gruppenavnkort":   rad.get("gruppenavnkort"),
+                "biografi":         rad.get("biografi"),
+                "startdato":        rad.get("startdato"),
+                "slutdato":         rad.get("slutdato"),
+                "opdateringsdato":  rad.get("opdateringsdato"),
+            })
+
+    # Enskilt uppslag — returnera objektet direkt så svaret blir lätt att läsa
+    if aktorid is not None:
+        if not aktorer:
+            return [types.TextContent(
+                type="text",
+                text=f"Ingen aktör hittades med aktørid={aktorid}."
+            )]
+        return [types.TextContent(
+            type="text",
+            text=json.dumps(aktorer[0], ensure_ascii=False, indent=2)
+        )]
+
+    # Batch-uppslag — returnera lista plus räknare så användaren ser om något saknas
+    svar = {
+        "begart_antal":     len(ids),
+        "returnerat_antal": len(aktorer),
+        "aktorer":          aktorer,
+    }
+    if fel:
+        svar["fel"] = fel
     return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
 
 
