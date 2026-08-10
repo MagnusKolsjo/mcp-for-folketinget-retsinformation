@@ -1,4 +1,4 @@
--- schema_sqlite.sql — SQLite-schema för ström 14 (Danmark).
+-- schema_sqlite.sql — SQLite-schema för dansk riksdags- och rättsdata.
 -- SQLite-installation: filbaserad databas utan pgvector.
 -- Vektorsökning (embeddings-tabellen) och pgvector-index saknas.
 -- Körs av db.initialisera_schema() — idempotent (CREATE ... IF NOT EXISTS).

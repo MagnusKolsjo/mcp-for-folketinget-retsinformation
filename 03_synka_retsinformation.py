@@ -1,5 +1,5 @@
 """
-03_synka_retsinformation.py — Synkskript för Retsinformation harvest-API (ström 14, Danmark).
+03_synka_retsinformation.py — Synkskript för Retsinformation harvest-API.
 
 Hämtar dansk lagstiftning (love, lovbekendtgørelser, bekendtgørelser m.fl.) via
 det officiella harvest-API:et på api.retsinformation.dk.

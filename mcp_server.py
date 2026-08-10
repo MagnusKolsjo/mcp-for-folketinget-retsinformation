@@ -1,5 +1,5 @@
 """
-mcp_server.py — MCP-server för dansk riksdags- och rättsdata (ström 14).
+mcp_server.py — MCP-server för dansk riksdags- och rättsdata.
 
 Datakällor:
   - Folketing ODA (oda.ft.dk): sager, dokument, afstemninger, ledamöter
@@ -32,6 +32,43 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Standardtak för fulltext i hämtverktygen. Danska lagtexter och betänkanden når nära en miljon tecken
+# och kan överskrida MCP-protokollets storleksgräns, vilket får anropet att
+# misslyckas helt. Anroparen kan höja taket eller sätta 0 för hela texten.
+DK_MAX_TECKEN = int(os.getenv("DK_MAX_TECKEN", "60000"))
+
+def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
+    """
+    Skär ut ett textutdrag och redovisa alltid vad som kapats.
+
+    Trunkering utan markering är ett tyst datafel — svaret ser ut att vara hela
+    innehållet. max_tecken <= 0 betyder ingen trunkering. Klipper på ordgräns.
+    """
+    text   = text or ""
+    totalt = len(text)
+    start  = max(0, min(fran_tecken, totalt))
+    rest   = text[start:]
+
+    if max_tecken and max_tecken > 0 and len(rest) > max_tecken:
+        utdrag    = rest[:max_tecken]
+        brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
+        if brytpunkt > max_tecken * 0.6:
+            utdrag = utdrag[:brytpunkt]
+        utdrag    = utdrag.rstrip()
+        trunkerad = True
+    else:
+        utdrag    = rest
+        trunkerad = False
+
+    slut = start + len(utdrag)
+    return {
+        "text":                 utdrag,
+        "tecken_totalt":        totalt,
+        "tecken_visade":        len(utdrag),
+        "trunkerad":            trunkerad,
+        "fortsatt_fran_tecken": slut if slut < totalt else None,
+    }
 
 import db
 import importlib.util as _iutil, pathlib as _pl
@@ -361,6 +398,21 @@ async def lista_verktyg():
                         "type": "integer",
                         "description": "ODA sagid (matchar `sagid`-fältet i dk_sok_folketing-resultat)",
                     },
+                    "max_tecken": {
+                        "type": "integer",
+                        "description": (
+                            "Teckentak för fulltexten (standard 60 000, 0 = hela texten). "
+                            "Danska lagtexter når nära en miljon tecken; utan tak "
+                            "riskerar anropet att överskrida svarsgränsen. Ett kapat svar "
+                            "bär trunkerad, tecken_totalt och fortsatt_fran_tecken."
+                        ),
+                        "default": 60000,
+                    },
+                    "fran_tecken": {
+                        "type": "integer",
+                        "description": "Börja texten vid denna teckenposition — för att läsa vidare.",
+                        "default": 0,
+                    },
                 },
             },
         ),
@@ -672,6 +724,8 @@ async def _dk_sok_lovgivning(args: dict):
 async def _dk_hamta_dokument(args: dict):
     dok_id = args.get("dok_id")
     sagid  = args.get("sagid")
+    max_tecken  = int(args.get("max_tecken", DK_MAX_TECKEN) or 0)
+    fran_tecken = int(args.get("fran_tecken", 0) or 0)
 
     if dok_id is not None:
         dok = db.hamta_dokument_med_id(int(dok_id))
@@ -720,9 +774,17 @@ async def _dk_hamta_dokument(args: dict):
         "url":                  dok.get("retsinformationsurl") or dok.get("url"),
         "lovnummer":            dok.get("lovnummer"),
         "resume":               dok.get("resume"),
-        "fulltext_md":          dok.get("fulltext_md"),
         "status":               dok.get("status"),
     }
+
+    # Databasen har alltid hela texten — trunkeringen gäller bara svaret.
+    _utdrag = _skar_ut(dok.get("fulltext_md"), max_tecken, fran_tecken)
+    svar["fulltext_md"] = _utdrag["text"] if dok.get("fulltext_md") else None
+    if dok.get("fulltext_md"):
+        svar["tecken_totalt"]        = _utdrag["tecken_totalt"]
+        svar["tecken_visade"]        = _utdrag["tecken_visade"]
+        svar["trunkerad"]            = _utdrag["trunkerad"]
+        svar["fortsatt_fran_tecken"] = _utdrag["fortsatt_fran_tecken"]
 
     if dok.get("status") == "Historic":
         svar["historisk"] = True

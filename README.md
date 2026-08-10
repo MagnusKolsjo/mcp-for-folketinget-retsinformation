@@ -60,6 +60,24 @@ Lägg till i `claude_desktop_config.json`:
 }
 ```
 
+
+## Svarsstorlek och trunkering
+
+MCP-protokollet har en övre storleksgräns per svar. Det största danska dokumentet i cachen är **958 297 tecken** — strax under gränsen, alltså inom felmarginalen för nästa något större lagtext.
+`dk_hamta_dokument` tar därför två parametrar:
+
+| Parameter | Innebörd |
+|---|---|
+| `max_tecken` | Teckentak för texten. Standard 60 000 tecken; `0` ger hela texten som ett uttryckligt val. |
+| `fran_tecken` | Börja vid denna teckenposition — för att läsa vidare där ett kapat svar slutade. |
+
+Ett kapat svar säger alltid ifrån med fälten `trunkerad`, `tecken_totalt`, `tecken_visade` och `fortsatt_fran_tecken`. Kapningen sker på ordgräns, aldrig mitt i
+ett ord.
+
+**Vid ordagranna citat:** citera aldrig ur ett svar som är markerat som kapat.
+Läs vidare med `fran_tecken` tills hela passagen är hämtad. Standardvärdet kan
+sättas i `.env` med `DK_MAX_TECKEN`.
+
 ## Licens
 
 GNU Affero General Public License v3.0 — se LICENSE.

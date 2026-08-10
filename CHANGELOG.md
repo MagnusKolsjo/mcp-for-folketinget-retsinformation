@@ -6,6 +6,28 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ---
 
+## [1.2.0] — 2026-08-10
+
+### Tillagt
+
+- **`max_tecken` och `fran_tecken` i `dk_hamta_dokument`**, med standardtaket
+  `DK_MAX_TECKEN` (60 000 tecken, konfigurerbart i `.env`). Det största danska
+  dokumentet i cachen är **958 297 tecken**, vilket gav ett svar på 970 017 tecken —
+  strax under MCP-protokollets gräns på 1 048 576, alltså inom felmarginalen för att
+  slå i taket vid nästa något större lagtext. Med standardtaket blir samma anrop
+  62 756 tecken. Kapade svar bär `trunkerad`, `tecken_totalt`, `tecken_visade` och
+  `fortsatt_fran_tecken`; kapningen sker på ordgräns.
+
+### Bakgrund
+
+Genomför projektets svarskontrakt (`00-las-forst.md` → "Svarskontraktet — storlek,
+trunkering, adressering och sökning"). Additiva parametrar och fält; inga brytande
+ändringar och inga schemaändringar. Cachen och databasen lagrar fortfarande hela
+texten — trunkeringen gäller bara svaret till anroparen, så sökning och indexering
+påverkas inte.
+
+---
+
 ## [1.1.0] — 2026-05-22
 
 Två nya MCP-verktyg.

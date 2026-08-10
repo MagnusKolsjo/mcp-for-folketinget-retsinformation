@@ -1,5 +1,5 @@
 """
-db.py — Databashantering för ström 14 (Danmark).
+db.py — Databashantering för dansk riksdags- och rättsdata.
 
 Stöder PostgreSQL (primär, med pgvector) och SQLite (explicit val).
 Schema: danmark

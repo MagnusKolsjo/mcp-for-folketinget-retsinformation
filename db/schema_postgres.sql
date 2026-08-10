@@ -1,4 +1,4 @@
--- schema_postgres.sql — PostgreSQL-schema för ström 14 (Danmark).
+-- schema_postgres.sql — PostgreSQL-schema för dansk riksdags- och rättsdata.
 -- Schema: danmark
 -- Körs av db.initialisera_schema() via CREATE ... IF NOT EXISTS — idempotent.
 -- OBS: CREATE EXTENSION vector körs separat med autocommit i db.py.

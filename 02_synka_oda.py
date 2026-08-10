@@ -1,5 +1,5 @@
 """
-02_synka_oda.py — Synkskript för Folketing ODA (ström 14, Danmark).
+02_synka_oda.py — Synkskript för Folketing ODA.
 
 Fas 1: Hämtar metadata för alla sager i ODA och lagrar i DB.
 Fas 2: Laddar hem och extraherar fulltext-PDF för lovforslag (typeid=3)

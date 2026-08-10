@@ -13,3 +13,6 @@ embeddings/
 *.log
 06_backfill_relationer.py
 07_backfill_datum.py
+
+# macOS
+.DS_Store

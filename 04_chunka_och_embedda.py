@@ -1,5 +1,5 @@
 """
-04_chunka_och_embedda.py — Chunkning och embedding för ström 14 (Danmark).
+04_chunka_och_embedda.py — Chunkning och embedding för dansk riksdags- och rättsdata.
 
 Läser fulltext_md (och resume) från dansk.dokument, delar upp i chunks och
 genererar embeddings med intfloat/multilingual-e5-base (768 dim).
@@ -379,7 +379,7 @@ def semantisk_sok_i_dokument(dok_id: int, fraga: str, limit: int = 5) -> dict:
 
 def main():
     global BATCH_STORLEK
-    parser = argparse.ArgumentParser(description="Chunkning och embedding för ström 14")
+    parser = argparse.ArgumentParser(description="Chunkning och embedding för dansk riksdags- och rättsdata")
     parser.add_argument("--batchstorlek", type=int, default=BATCH_STORLEK,
                         help=f"Embedding-batch-storlek (standard {BATCH_STORLEK})")
     parser.add_argument("--bara-resume", action="store_true",
