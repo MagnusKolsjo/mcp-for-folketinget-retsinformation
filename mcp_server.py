@@ -216,6 +216,7 @@ class Dokument(TypedDict):
     fortsatt_fran_tecken: NotRequired[int | None]
     historisk: NotRequired[bool]
     advarsel: NotRequired[str]
+    andringar_kontrollerade: NotRequired[bool]
     andringar_efter_senaste_lbk: NotRequired[list[Andringslag]]
     advarsel_andringar: NotRequired[str]
 
@@ -898,6 +899,7 @@ def dk_hamta_dokument(
     if eli_url and dok.get("kalla") == "retsinformation":
         try:
             andringar = db.hamta_andringar_for_lag(eli_url)
+            svar["andringar_kontrollerade"] = True
             if andringar:
                 svar["andringar_efter_senaste_lbk"] = [
                     {
@@ -916,7 +918,15 @@ def dk_hamta_dokument(
                     "Se andringar_efter_senaste_lbk för detaljer."
                 )
         except Exception as e:
+            # Texten returneras ändå, men den får inte se gällande ut när
+            # ändringarna inte gick att kontrollera.
             logger.warning("Kunde inte hämta relationer för %s: %s", eli_url, e)
+            svar["andringar_kontrollerade"] = False
+            svar["advarsel_andringar"] = (
+                "OBS: Det gick inte att kontrollera om ändringslagar tillkommit efter "
+                f"denna version ({type(e).__name__}). Texten kan vara inaktuell; "
+                "kontrollera dokumentet på retsinformation.dk."
+            )
 
     return svar
 

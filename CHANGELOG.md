@@ -44,6 +44,9 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- `dk_hamta_dokument` visar när ändringslagarna inte gick att kontrollera
+  (`andringar_kontrollerade: false` och en varning i `advarsel_andringar`).
+  Tidigare svaldes felet, och en inaktuell lagtext såg gällande ut.
 - När en ft.dk-PDF inte ger någon text säger `anmarkning` varför: botskydd,
   nätverksfel, saknat paket (curl-cffi, pymupdf4llm), trasig PDF eller en
   inskannad PDF utan text. Tidigare blev `fulltext_md` tyst null.
