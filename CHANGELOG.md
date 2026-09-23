@@ -44,6 +44,13 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- `dk_hamta_dokument` skickar bara Folketingets PDF:er på ft.dk till
+  PDF-hämtningen. Retsinformation-dokument utan lokal fulltext (drygt 6 000,
+  främst äldre och historiska) gick tidigare samma väg: servern hämtade
+  HTML-sidan bakom ELI-länken, utanför källans anropsgräns, och
+  `fulltext_md` blev null utan förklaring. Nu görs inget anrop, och det nya
+  fältet `anmarkning` säger varför texten saknas och länkar till
+  retsinformation.dk.
 - När embeddingmodellen inte kan laddas ger de semantiska verktygen ett
   verktygsfel som namnger modellen och orsaken, i stället för ett allmänt fel.
 - Bara fel i `DATABASE_URL` och schemafilerna kallas konfigurationsfel

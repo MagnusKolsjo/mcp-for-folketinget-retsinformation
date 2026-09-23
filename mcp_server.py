@@ -10,8 +10,11 @@ Datakällor:
 
 Sökverktygen läser den lokala databasen, som fylls av synkskripten.
 Verktygen för ärenden, voteringar, aktörer och valperioder hämtar live
-från ODA. Servern gör inga anrop mot Retsinformations API; det sköter
-synken, som också respekterar källans anropsgräns.
+från ODA, och dk_hamta_dokument hämtar Folketingets PDF:er från ft.dk när
+fulltexten saknas lokalt. Servern gör inga anrop mot Retsinformation; det
+sköter synken, som också respekterar källans anropsgräns (ett anrop per
+tionde sekund, 03:00–23:45). Saknas fulltexten för ett
+Retsinformation-dokument lokalt säger svaret det i fältet anmarkning.
 
 Prefix: dk_
 Schema: danmark
@@ -26,6 +29,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Annotated, NotRequired, Optional, Required, TypedDict
 
 from dotenv import load_dotenv
@@ -205,6 +209,7 @@ class Dokument(TypedDict):
     resume: str | None
     status: str | None
     fulltext_md: str | None
+    anmarkning: NotRequired[str]
     tecken_totalt: NotRequired[int]
     tecken_visade: NotRequired[int]
     trunkerad: NotRequired[bool]
@@ -416,6 +421,13 @@ def _hamta_pdf_bytes(url: str) -> Optional[bytes]:
     except Exception as e:
         logger.error("PDF-nedladdning misslyckades: %s — %s", url, e)
         return None
+
+
+def _ar_ftdk_pdf(url: str) -> bool:
+    """True för Folketingets PDF:er på ft.dk — de enda filer servern hämtar själv."""
+    delar = urlparse(url)
+    return (delar.hostname or "").lower() in ("www.ft.dk", "ft.dk") \
+        and delar.path.lower().endswith(".pdf")
 
 
 def _extrahera_pdf_text(pdf_bytes: bytes) -> Optional[str]:
@@ -773,7 +785,7 @@ def dk_hamta_dokument(
     ))] = DK_MAX_TECKEN,
     fran_tecken: Annotated[int, Field(description="Börja texten vid denna teckenposition — för att läsa vidare.")] = 0,
 ) -> Dokument | Sag:
-    """Hämtar fulltext och metadata för ett danskt dokument via dess interna id eller ODA sagid. Om fulltexten inte finns i cache hämtas PDF:en från ft.dk med curl-cffi och extraheras med pymupdf4llm. OBS: Vid sagid-uppslag returneras hela sagen plus listan över kopplade dokument (upp till 50). Äldre dokument (typiskt före 2015) saknar Fil-records i ODA, så fil_url kan vara null. För antagna lagar kan lagtexten ändå nås via retsinformationsurl eller via dk_sok_lovgivning."""
+    """Hämtar fulltext och metadata för ett danskt dokument via dess interna id eller ODA sagid. Om fulltexten för ett Folketingsdokument inte finns i cache hämtas PDF:en från ft.dk med curl-cffi och extraheras med pymupdf4llm. Retsinformation-dokument hämtas aldrig vid anrop; saknas deras fulltext lokalt är fulltext_md null och fältet anmarkning säger varför och länkar till retsinformation.dk. OBS: Vid sagid-uppslag returneras hela sagen plus listan över kopplade dokument (upp till 50). Äldre dokument (typiskt före 2015) saknar Fil-records i ODA, så fil_url kan vara null. För antagna lagar kan lagtexten ändå nås via retsinformationsurl eller via dk_sok_lovgivning."""
     if max_tecken <= 0 or max_tecken > DK_MAX_TECKEN_TAK:
         max_tecken = DK_MAX_TECKEN_TAK
     fran_tecken = max(0, fran_tecken)
@@ -795,8 +807,27 @@ def dk_hamta_dokument(
             "sökverktygen; ett ODA-ärende hämtas med sagid."
         )
 
-    # Saknas fulltext men finns en URL hämtas PDF:en och sparas i databasen
-    if not dok.get("fulltext_md") and dok.get("url"):
+    # Saknas fulltext hämtas bara Folketingets PDF:er från ft.dk. Övriga
+    # url:er, i praktiken Retsinformations ELI-länkar, pekar på HTML-sidor;
+    # där förklarar anmarkning varför texten saknas.
+    anmarkning: Optional[str] = None
+    if not dok.get("fulltext_md") and not (dok.get("url") and _ar_ftdk_pdf(dok["url"])):
+        lank = dok.get("retsinformationsurl") or dok.get("url")
+        if dok.get("kalla") == "retsinformation":
+            anmarkning = (
+                "Fulltexten finns inte i den lokala databasen. Synken fick ingen lagtext "
+                "ur Retsinformations ELI-XML för dokumentet, vilket är vanligt för äldre "
+                "och historiska dokument. Servern hämtar inte från Retsinformation vid "
+                "anrop; läs dokumentet på retsinformation.dk"
+                + (f": {lank}" if lank else ".")
+            )
+        else:
+            anmarkning = (
+                "Fulltexten finns inte i den lokala databasen"
+                + (f", och länken ({lank}) är ingen PDF från ft.dk som servern kan hämta."
+                   if lank else ", och dokumentet har ingen länk till en fil.")
+            )
+    elif not dok.get("fulltext_md"):
         logger.info("Hämtar PDF för dok %s: %s", dok.get("id"), dok.get("url"))
         pdf_bytes = _hamta_pdf_bytes(dok["url"])
         if pdf_bytes:
@@ -829,6 +860,8 @@ def dk_hamta_dokument(
         "status":               dok.get("status"),
         "fulltext_md":          None,
     }
+    if anmarkning:
+        svar["anmarkning"] = anmarkning
 
     # Databasen har alltid hela texten — trunkeringen gäller bara svaret.
     if dok.get("fulltext_md"):
