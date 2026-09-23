@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Magnus Kolsjö
+
 """
 mcp_server.py — MCP-server för dansk riksdags- och rättsdata.
 
@@ -5,25 +8,34 @@ Datakällor:
   - Folketing ODA (oda.ft.dk): sager, dokument, afstemninger, ledamöter
   - Retsinformation (api.retsinformation.dk): dansk lagstiftning via harvest-API
 
+Sökverktygen läser den lokala databasen, som fylls av synkskripten.
+Verktygen för ärenden, voteringar, aktörer och valperioder hämtar live
+från ODA. Servern gör inga anrop mot Retsinformations API; det sköter
+synken, som också respekterar källans anropsgräns.
+
 Prefix: dk_
 Schema: danmark
+
+Transport väljs med MCP_TRANSPORT (stdio eller http), se mcp_transport.py.
 """
 
-import os
-import sys
-import json
+import contextlib
+import importlib.util
 import logging
+import os
+import sqlite3
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, NotRequired, Optional, Required, TypedDict
 
 from dotenv import load_dotenv
 
-# Ladda .env relativt skriptets mapp
+# Ladda .env relativt skriptets mapp. Servern ärver inte klientens
+# shell-miljö, så .env måste läsas innan konfigurationen nedan.
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 load_dotenv(_SCRIPT_DIR / ".env")
 
-# Loggning till fil (MCP stdio kräver ren stdout)
+# Loggning till fil. I stdio-läget är stdout protokollkanalen.
 _LOG_DIR = _SCRIPT_DIR / "logs"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -33,10 +45,405 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Standardtak för fulltext i hämtverktygen. Danska lagtexter och betänkanden når nära en miljon tecken
-# och kan överskrida MCP-protokollets storleksgräns, vilket får anropet att
-# misslyckas helt. Anroparen kan höja taket eller sätta 0 för hela texten.
+import httpx
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
+
+import db
+from mcp_annotationer import CACHE_HINTAR, LASNING_DB, LASNING_EXTERN
+from mcp_transport import starta
+from tyst_fd import tysta_fd
+
+try:
+    import psycopg2
+    _DB_FEL: tuple[type[Exception], ...] = (psycopg2.Error, sqlite3.Error)
+except ImportError:
+    _DB_FEL = (sqlite3.Error,)
+
+try:
+    from curl_cffi import requests as cf_requests
+    _CURL_CFFI_TILLGANGLIG = True
+except ImportError:
+    _CURL_CFFI_TILLGANGLIG = False
+    logger.warning("curl-cffi saknas — ft.dk PDF-nedladdning ej tillgänglig")
+
+
+# ---------------------------------------------------------------------------
+# Konfiguration
+# ---------------------------------------------------------------------------
+
+ODA_BAS_URL = "https://oda.ft.dk/api"
+
+QUERY_EXPANSION_BASE_URL = os.getenv("QUERY_EXPANSION_BASE_URL", "http://localhost:11434/v1")
+QUERY_EXPANSION_API_KEY  = os.getenv("QUERY_EXPANSION_API_KEY", "ollama")
+QUERY_EXPANSION_MODEL    = os.getenv("QUERY_EXPANSION_MODEL", "llama3")
+
+# Standardtak för fulltext i dk_hamta_dokument. Danska lagtexter och
+# betænkninger når nära en miljon tecken; anroparen kan höja taket upp
+# till DK_MAX_TECKEN_TAK.
 DK_MAX_TECKEN = int(os.getenv("DK_MAX_TECKEN", "60000"))
+
+# Absolut tak per svar. Ett verktygssvar skickas både som JSON-text och som
+# strukturerat innehåll, alltså två gånger. 400 000 tecken ger drygt 800 000
+# tecken totalt, med marginal under MCP-klienternas gräns på 1 MiB även när
+# danska tecken tar två byte i UTF-8. Längre texter läses i flera anrop med
+# fran_tecken.
+DK_MAX_TECKEN_TAK = 400_000
+
+PDF_CACHE_DIR = Path(os.getenv("PDF_CACHE_DIR", str(_SCRIPT_DIR / "pdf_cache")))
+if not PDF_CACHE_DIR.is_absolute():
+    PDF_CACHE_DIR = _SCRIPT_DIR / PDF_CACHE_DIR
+PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+_HTTPX_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "mcp-for-folketinget-retsinformation/1.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
+}
+
+_SQLITE_EJ_VEKTOR = (
+    "Semantisk sökning kräver PostgreSQL med pgvector. Servern kör mot SQLite, "
+    "som saknar embeddings. Använd dk_sok, dk_sok_folketing eller dk_sok_lovgivning."
+)
+
+
+# ---------------------------------------------------------------------------
+# Returtyper
+#
+# Fälten speglar databasens kolumner (alla TEXT utom id) och ODA:s entiteter.
+# Allt som kan saknas i källdata är `| None`: äldre ODA-ärenden och äldre
+# Retsinformation-dokument har ofta tomma fält, och ett None där typen säger
+# str får hela anropet att misslyckas.
+# ---------------------------------------------------------------------------
+
+class Traff(TypedDict, total=False):
+    """En träff i dk_sok och dk_sok_folketing: en rad ur dokumenttabellen."""
+    dok_id: Required[int]
+    kalla: str | None
+    beteckning: str | None
+    typ: str | None
+    titel: str | None
+    titelkort: str | None
+    periode: str | None
+    datum: str | None
+    url: str | None
+    retsinformationsurl: str | None
+    lovnummer: str | None
+    resume: str | None
+    afstemningskonklusion: str | None
+    paragrafnummer: str | None
+    paragraf: str | None
+    afgoerelse: str | None
+    begrundelse: str | None
+    baggrundsmateriale: str | None
+    status: str | None
+    giltig_till: str | None
+    rank: float | None
+    sagid: str
+    retsinformation_id: str
+
+
+class SokSvar(TypedDict):
+    sokterm: str
+    expansion: str | None
+    antal_traffar: int
+    traffar: list[Traff]
+
+
+class FolketingSvar(TypedDict):
+    kalla: str
+    sokterm: str
+    antal_traffar: int
+    traffar: list[Traff]
+
+
+class LovTraff(TypedDict):
+    dok_id: int
+    beteckning: str | None
+    typ: str | None
+    titel: str | None
+    titelkort: str | None
+    ikrafttraedelsesdato: str | None
+    url: str | None
+    lovnummer: str | None
+    resume: str | None
+    retsinformation_id: NotRequired[str]
+    historisk: NotRequired[bool]
+    advarsel: NotRequired[str]
+
+
+class LovSvar(TypedDict):
+    kalla: str
+    sokterm: str
+    inkludera_historiska: bool
+    antal_traffar: int
+    traffar: list[LovTraff]
+
+
+class Andringslag(TypedDict):
+    beteckning: str | None
+    typ: str | None
+    titel: str | None
+    ikrafttraedelsesdato: str | None
+    url: str | None
+    lovnummer: str | None
+
+
+class Dokument(TypedDict):
+    """dk_hamta_dokument med dok_id: ett dokument ur den lokala databasen."""
+    id: int
+    kalla: str | None
+    beteckning: str | None
+    typ: str | None
+    titel: str | None
+    titelkort: str | None
+    ikrafttraedelsesdato: str | None
+    url: str | None
+    lovnummer: str | None
+    resume: str | None
+    status: str | None
+    fulltext_md: str | None
+    tecken_totalt: NotRequired[int]
+    tecken_visade: NotRequired[int]
+    trunkerad: NotRequired[bool]
+    fortsatt_fran_tecken: NotRequired[int | None]
+    historisk: NotRequired[bool]
+    advarsel: NotRequired[str]
+    andringar_efter_senaste_lbk: NotRequired[list[Andringslag]]
+    advarsel_andringar: NotRequired[str]
+
+
+class SagDokument(TypedDict):
+    dokumentid: int
+    titel: str | None
+    typeid: int | None
+    dato: str | None
+    fil_url: str | None
+
+
+class Sag(TypedDict):
+    """dk_hamta_dokument med sagid: ett ärende hämtat live från ODA."""
+    sagid: int
+    beteckning: str | None
+    titel: str | None
+    titelkort: str | None
+    typeid: int | None
+    statusid: int | None
+    periodeid: int | None
+    resume: str | None
+    afstemningskonklusion: str | None
+    lovnummer: str | None
+    retsinformationsurl: str | None
+    paragrafnummer: str | None
+    paragraf: str | None
+    afgoerelse: str | None
+    begrundelse: str | None
+    baggrundsmateriale: str | None
+    dokument: list[SagDokument]
+
+
+class Periode(TypedDict):
+    id: int
+    kod: str | None
+    titel: str | None
+    startdatum: str | None
+    slutdatum: str | None
+
+
+# Funktionell syntax: nycklarna "aktørid" och "for" går inte att skriva
+# som klassattribut ("for" är ett reserverat ord).
+Stemme = TypedDict("Stemme", {
+    "aktørid": int | None,
+    "typeid": int | None,
+})
+
+Afstemning = TypedDict("Afstemning", {
+    "afstemningid": int | None,
+    "sagstrinid": int | None,
+    "sagstrin_typeid": int | None,
+    "konklusion": str | None,
+    "for": int | None,
+    "imod": int | None,
+    "hverken": int | None,
+    "fravaerende": int | None,
+    "vedtaget": bool | None,
+    "stemmer": NotRequired[list[Stemme]],
+})
+
+
+class AfstemningSvar(TypedDict):
+    sagid: int
+    antal_afstemninger: int
+    afstemninger: list[Afstemning]
+
+
+class SemantiskTraff(TypedDict):
+    id: int
+    kalla: str | None
+    beteckning: str | None
+    typ: str | None
+    titel: str | None
+    titelkort: str | None
+    periode: str | None
+    datum: str | None
+    url: str | None
+    retsinformationsurl: str | None
+    lovnummer: str | None
+    resume: str | None
+    paragrafnummer: str | None
+    avstand: float | None
+
+
+class SemantiskSvar(TypedDict):
+    sokterm: str
+    metod: str
+    antal_traffar: int
+    traffar: list[SemantiskTraff]
+
+
+class ChunkTraff(TypedDict):
+    chunk_nr: int
+    text: str
+    avstand: float | None
+
+
+class SokIDokumentSvar(TypedDict):
+    dok_id: int
+    kalla: str | None
+    beteckning: str | None
+    typ: str | None
+    titel: str | None
+    fraga: str
+    antal_chunks: int
+    antal_traffar: int
+    traffar: list[ChunkTraff]
+
+
+Aktor = TypedDict("Aktor", {
+    "aktørid": int | None,
+    "typeid": int | None,
+    "navn": str | None,
+    "fornavn": str | None,
+    "efternavn": str | None,
+    "gruppenavnkort": str | None,
+    "biografi": str | None,
+    "startdato": str | None,
+    "slutdato": str | None,
+    "opdateringsdato": str | None,
+})
+
+
+class AktorBatchFel(TypedDict):
+    batch: list[int]
+    fel: str
+
+
+class AktorBatch(TypedDict):
+    begart_antal: int
+    returnerat_antal: int
+    aktorer: list[Aktor]
+    fel: NotRequired[list[AktorBatchFel]]
+
+
+# ---------------------------------------------------------------------------
+# Felöversättning
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _som_toolerror(vad: str):
+    """Översätter förväntade fel från ODA och databasen till ToolError.
+
+    Utan översättningen får klienten bara "Error executing tool" utan
+    orsak. Oväntade fel (programfel) släpps igenom; de loggas med spår av
+    SDK:n och ska inte döljas bakom ett till synes begripligt meddelande.
+    """
+    try:
+        yield
+    except ToolError:
+        raise
+    except httpx.HTTPStatusError as fel:
+        logger.warning("ODA-fel vid %s: %s", vad, fel)
+        raise ToolError(
+            f"Folketingets ODA svarade med HTTP {fel.response.status_code} vid {vad}. "
+            "Kontrollera id:t eller försök igen senare."
+        ) from fel
+    except httpx.RequestError as fel:
+        logger.warning("ODA onåbar vid %s: %s", vad, fel)
+        raise ToolError(
+            f"Folketingets ODA (oda.ft.dk) gick inte att nå vid {vad} "
+            f"({type(fel).__name__}). Försök igen senare."
+        ) from fel
+    except _DB_FEL as fel:
+        logger.error("Databasfel vid %s: %s", vad, fel, exc_info=True)
+        raise ToolError(
+            f"Databasfel vid {vad}: {fel}. Kontrollera att databasen är igång "
+            "och att DATABASE_URL i .env pekar rätt."
+        ) from fel
+    except RuntimeError as fel:
+        # db._hamta_url() kastar RuntimeError när DATABASE_URL saknas eller är fel
+        logger.error("Konfigurationsfel vid %s: %s", vad, fel)
+        raise ToolError(f"Konfigurationsfel vid {vad}: {fel}") from fel
+
+
+# ---------------------------------------------------------------------------
+# HTTP och PDF
+# ---------------------------------------------------------------------------
+
+def _oda_get(endpoint: str, params: Optional[dict] = None) -> dict:
+    """GET-anrop mot Folketing ODA. Lägger till $format=json automatiskt."""
+    params = dict(params or {})
+    params.setdefault("$format", "json")
+    url = f"{ODA_BAS_URL}/{endpoint}"
+    logger.info("ODA GET %s %s", url, params)
+    resp = httpx.get(url, params=params, headers=_HTTPX_HEADERS, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _hamta_pdf_bytes(url: str) -> Optional[bytes]:
+    """
+    Laddar ned en PDF från ft.dk med curl-cffi (kringgår Cloudflare managed challenge).
+    Returnerar PDF-bytes eller None vid fel.
+    """
+    if not _CURL_CFFI_TILLGANGLIG:
+        logger.error("curl-cffi saknas — kan inte ladda ned ft.dk PDF: %s", url)
+        return None
+    try:
+        resp = cf_requests.get(url, impersonate="chrome", timeout=60)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        logger.error("PDF-nedladdning misslyckades: %s — %s", url, e)
+        return None
+
+
+def _extrahera_pdf_text(pdf_bytes: bytes) -> Optional[str]:
+    """Extraherar text från PDF-bytes med pymupdf4llm."""
+    try:
+        import tempfile
+        import pymupdf4llm
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bytes)
+            tmp_vag = f.name
+        try:
+            # Låset i tysta_fd serialiserar också pymupdf-anropen, som inte
+            # tål att köras från flera trådar samtidigt.
+            with tysta_fd(_LOG_DIR / "subprocess.log"):
+                text = pymupdf4llm.to_markdown(tmp_vag)
+            return text if text.strip() else None
+        finally:
+            os.unlink(tmp_vag)
+    except ImportError:
+        logger.warning("pymupdf4llm saknas — PDF-extraktion ej tillgänglig")
+        return None
+    except Exception as e:
+        logger.error("PDF-extraktion misslyckades: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Textutdrag
+# ---------------------------------------------------------------------------
 
 def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
     """
@@ -70,19 +477,19 @@ def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
         "fortsatt_fran_tecken": slut if slut < totalt else None,
     }
 
-import db
-from tyst_fd import tysta_fd
-import importlib.util as _iutil, pathlib as _pl
 
-# Lazy-import av hela chunka/embedda-modulen. Filnamnet börjar med en siffra
-# och kan inte importeras direkt — importlib används istället. Modulen laddas
-# en gång och cachas; därefter exponeras enskilda funktioner via wrappers.
+# ---------------------------------------------------------------------------
+# Chunk- och embeddingmodulen (lat inläsning)
+# ---------------------------------------------------------------------------
+
+# Filnamnet börjar med en siffra och kan inte importeras direkt, så modulen
+# laddas med importlib. Den laddas en gång och bär embeddingmodellen.
 _chunka_modul = None
 _chunka_modul_las = threading.Lock()
 
 
 def _hamta_chunka_modul():
-    """Laddar 04_chunka_och_embedda.py och returnerar modulobjektet (lazy).
+    """Laddar 04_chunka_och_embedda.py och returnerar modulobjektet.
 
     Dubbelkontrollerad låsning: två samtidiga verktygsanrop får samma
     modulobjekt och därmed samma embeddingmodell.
@@ -91,126 +498,27 @@ def _hamta_chunka_modul():
     if _chunka_modul is None:
         with _chunka_modul_las:
             if _chunka_modul is None:
-                modul_vag = _pl.Path(__file__).parent / "04_chunka_och_embedda.py"
-                spec = _iutil.spec_from_file_location("chunka_embedda", modul_vag)
-                modul = _iutil.module_from_spec(spec)
+                modul_vag = _SCRIPT_DIR / "04_chunka_och_embedda.py"
+                spec = importlib.util.spec_from_file_location("chunka_embedda", modul_vag)
+                modul = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(modul)
                 _chunka_modul = modul
     return _chunka_modul
 
 
-def _hamta_semantisk_sok():
-    return _hamta_chunka_modul().semantisk_sok
+def _forvarm_embedding() -> None:
+    """Laddar embeddingmodellen före första anropet i http-läget.
 
-
-def _hamta_semantisk_sok_i_dokument():
-    return _hamta_chunka_modul().semantisk_sok_i_dokument
-
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp import types
-
-# ---------------------------------------------------------------------------
-# Konfiguration
-# ---------------------------------------------------------------------------
-
-ODA_BAS_URL = "https://oda.ft.dk/api"
-RETSINFORMATION_BAS_URL = "https://api.retsinformation.dk/v1"
-
-QUERY_EXPANSION_BASE_URL = os.getenv("QUERY_EXPANSION_BASE_URL", "http://localhost:11434/v1")
-QUERY_EXPANSION_API_KEY  = os.getenv("QUERY_EXPANSION_API_KEY", "ollama")
-QUERY_EXPANSION_MODEL    = os.getenv("QUERY_EXPANSION_MODEL", "llama3")
-MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
-MCP_HOST      = os.getenv("MCP_HOST", "127.0.0.1")
-MCP_PORT      = int(os.getenv("MCP_PORT", "8714"))
-MCP_API_KEY   = os.getenv("MCP_API_KEY", "")
-
-PDF_CACHE_DIR = Path(os.getenv("PDF_CACHE_DIR", str(_SCRIPT_DIR / "pdf_cache")))
-if not PDF_CACHE_DIR.is_absolute():
-    PDF_CACHE_DIR = _SCRIPT_DIR / PDF_CACHE_DIR
-PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-PDF_CACHE_TTL_DAGAR = int(os.getenv("PDF_CACHE_TTL_DAGAR", "1"))
-
-# ---------------------------------------------------------------------------
-# HTTP-klient (curl-cffi för ft.dk PDFer, httpx för övriga)
-# ---------------------------------------------------------------------------
-
-try:
-    from curl_cffi import requests as cf_requests
-    _CURL_CFFI_TILLGANGLIG = True
-except ImportError:
-    _CURL_CFFI_TILLGANGLIG = False
-    logger.warning("curl-cffi saknas — ft.dk PDF-nedladdning ej tillgänglig")
-
-import httpx
-
-_HTTPX_HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "mcp-for-folketinget-retsinformation/1.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
-}
-
-
-def _oda_get(endpoint: str, params: dict = None) -> dict:
-    """GET-anrop mot Folketing ODA. Lägger till $format=json automatiskt."""
-    if params is None:
-        params = {}
-    params.setdefault("$format", "json")
-    url = f"{ODA_BAS_URL}/{endpoint}"
-    logger.info("ODA GET %s %s", url, params)
-    resp = httpx.get(url, params=params, headers=_HTTPX_HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _retsinformation_get(endpoint: str, params: dict = None) -> dict:
-    """GET-anrop mot Retsinformation harvest-API."""
-    if params is None:
-        params = {}
-    url = f"{RETSINFORMATION_BAS_URL}/{endpoint}"
-    logger.info("Retsinformation GET %s %s", url, params)
-    resp = httpx.get(url, params=params, headers=_HTTPX_HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _hamta_pdf_bytes(url: str) -> Optional[bytes]:
+    Ett fel här ska inte hindra uppstarten: de övriga verktygen fungerar
+    utan modellen, och de semantiska verktygen försöker igen vid anrop.
     """
-    Laddar ned en PDF från ft.dk med curl-cffi (kringgår Cloudflare managed challenge).
-    Returnerar PDF-bytes eller None vid fel.
-    """
-    if not _CURL_CFFI_TILLGANGLIG:
-        logger.error("curl-cffi saknas — kan inte ladda ned ft.dk PDF: %s", url)
-        return None
+    if not db._ar_postgres():
+        return
     try:
-        resp = cf_requests.get(url, impersonate="chrome", timeout=60)
-        resp.raise_for_status()
-        return resp.content
-    except Exception as e:
-        logger.error("PDF-nedladdning misslyckades: %s — %s", url, e)
-        return None
-
-
-def _extrahera_pdf_text(pdf_bytes: bytes) -> Optional[str]:
-    """Extraherar text från PDF-bytes med pymupdf4llm."""
-    try:
-        import tempfile
-        import pymupdf4llm
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            f.write(pdf_bytes)
-            tmp_vag = f.name
-        try:
-            with tysta_fd(_LOG_DIR / "subprocess.log"):
-                text = pymupdf4llm.to_markdown(tmp_vag)
-            return text if text.strip() else None
-        finally:
-            os.unlink(tmp_vag)
-    except ImportError:
-        logger.warning("pymupdf4llm saknas — PDF-extraktion ej tillgänglig")
-        return None
-    except Exception as e:
-        logger.error("PDF-extraktion misslyckades: %s", e)
-        return None
+        _hamta_chunka_modul()._hamta_modell()
+        logger.info("Embeddingmodellen förvärmd")
+    except Exception as fel:
+        logger.warning("Förvärmning av embeddingmodellen misslyckades: %s", fel)
 
 
 # ---------------------------------------------------------------------------
@@ -250,323 +558,32 @@ def _expandera_fraga(fraga: str) -> str:
 # MCP-server
 # ---------------------------------------------------------------------------
 
-server = Server("danmark")
+mcp = MCPServer(
+    "danmark",
+    instructions=(
+        "MCP-server för dansk riksdags- och rättsdata: Folketingets öppna data (ODA) "
+        "och konsoliderad lagstiftning från Retsinformation. Verktygen har prefixet dk_. "
+        "LOKALT OCH LIVE: dk_sok, dk_sok_folketing, dk_sok_lovgivning, dk_sok_semantisk "
+        "och dk_sok_i_dokument läser en lokal databas som synkas dagligen. "
+        "dk_hamta_afstemning, dk_hamta_aktor, dk_lista_perioder och dk_hamta_dokument "
+        "med sagid hämtar live från ODA. "
+        "KEDJOR: sök → dk_hamta_dokument(dok_id) → dk_sok_i_dokument(dok_id, fraga) för "
+        "enskilda passager. För ett ärende: sagid ur dk_sok_folketing → "
+        "dk_hamta_dokument(sagid) eller dk_hamta_afstemning(sagid) → "
+        "dk_hamta_aktor(aktorider) för namn och parti. "
+        "GÄLLANDE RÄTT: dk_sok_lovgivning visar som standard bara gällande lagstiftning; "
+        "historiska träffar märks med historisk=true. dk_hamta_dokument varnar när "
+        "ändringslagar tillkommit efter den konsoliderade versionen. "
+        "SVARSSTORLEK: dk_hamta_dokument kapar fulltexten vid max_tecken. Ett kapat svar "
+        "bär trunkerad, tecken_totalt och fortsatt_fran_tecken; citera aldrig ordagrant "
+        "ur ett kapat svar utan att läsa vidare med fran_tecken."
+    ),
+    version="1.2.0",
+    cache_hints=CACHE_HINTAR,
+)
 
 
-@server.list_tools()
-async def lista_verktyg():
-    return [
-        types.Tool(
-            name="dk_sok",
-            description=(
-                "Söker i alla danska källor (Folketing ODA + Retsinformation) via lokal databas. "
-                "Accepterar kommaseparerade söktermer (OR-logik). "
-                "Stöder termexpansion till dansk parlamentarisk och juridisk terminologi."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sokterm": {
-                        "type": "string",
-                        "description": "Sökterm eller kommaseparerade termer (OR-logik), t.ex. 'klima, CO2, drivhusgas'",
-                    },
-                    "typ": {
-                        "type": "string",
-                        "description": "Filtrera på dokumenttyp: 'lovforslag', 'lov', 'bekendtgorelse', 'betaenkning' m.fl.",
-                    },
-                    "periode": {
-                        "type": "string",
-                        "description": "Filtrera på valperiod, t.ex. '20242' (2024-25)",
-                    },
-                    "max_traffar": {
-                        "type": "integer",
-                        "description": "Max antal resultat (standard 20)",
-                        "default": 20,
-                    },
-                    "expandera": {
-                        "type": "boolean",
-                        "description": "Expandera söktermen med juridisk terminologi (standard true)",
-                        "default": True,
-                    },
-                },
-                "required": ["sokterm"],
-            },
-        ),
-        types.Tool(
-            name="dk_sok_folketing",
-            description=(
-                "Söker i Folketing ODA — lovforslag, beslutningsforslag, betænkninger, "
-                "forespørgsler. Sökning mot lokal databas (FTS + pgvector). "
-                "Returnerar sagid, typ, titel, resume, paragrafnummer m.fl. "
-                "Stöder filtrering på paragrafnummer för direkt §-koppling."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sokterm": {
-                        "type": "string",
-                        "description": "Sökterm eller kommaseparerade termer",
-                    },
-                    "typ": {
-                        "type": "string",
-                        "description": "Dokumenttyp: 'lovforslag', 'beslutningsforslag', 'foresporgsel', 'betaenkning'",
-                    },
-                    "periode": {
-                        "type": "string",
-                        "description": "Valperiod, t.ex. '20242'",
-                    },
-                    "paragrafnummer": {
-                        "type": "string",
-                        "description": "Filtrera på paragrafnummer, t.ex. '15' för § 15",
-                    },
-                    "max_traffar": {
-                        "type": "integer",
-                        "default": 20,
-                    },
-                },
-                "required": ["sokterm"],
-            },
-        ),
-        types.Tool(
-            name="dk_sok_lovgivning",
-            description=(
-                "Söker i dansk lagstiftning från Retsinformation — "
-                "love (LOV), lovbekendtgørelser (LBK), bekendtgørelser (BEK), "
-                "cirkulærer (CIR), vejledninger (VEJ). Sökning mot lokal databas.\n\n"
-                "Som standard returneras endast GÆLDENDE (gällande) lagstiftning — "
-                "dokument med status 'Valid' i Retsinformations Lex Dania-system. "
-                "Historiska lagar (HISTORISK/notInForce) är upphävda och inte längre "
-                "gällande rätt; de inkluderas inte i standardsökningen. "
-                "Sätt inkludera_historiska=true om användaren explicit efterfrågar "
-                "historiska eller upphävda regler. Historiska träffar markeras med "
-                "historisk=true i svaret."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sokterm": {
-                        "type": "string",
-                        "description": "Sökterm eller kommaseparerade termer",
-                    },
-                    "typ": {
-                        "type": "string",
-                        "description": "Lagtyp: 'lov', 'lovbekendtgorelse', 'bekendtgorelse', 'cirkular', 'vejledning'",
-                    },
-                    "inkludera_historiska": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Inkludera historiska/upphävda lagar (HISTORISK). Sätt true endast om användaren explicit efterfrågar det.",
-                    },
-                    "max_traffar": {
-                        "type": "integer",
-                        "default": 20,
-                    },
-                },
-                "required": ["sokterm"],
-            },
-        ),
-        types.Tool(
-            name="dk_hamta_dokument",
-            description=(
-                "Hämtar fulltext och metadata för ett danskt dokument via dess interna id "
-                "eller ODA sagid. Om fulltexten inte finns i cache hämtas PDF:en från ft.dk "
-                "med curl-cffi och extraheras med pymupdf4llm. "
-                "OBS: Vid sagid-uppslag returneras hela sagen plus listan över kopplade "
-                "dokument (upp till 50). Äldre dokument (typiskt före 2015) saknar "
-                "Fil-records i ODA, så fil_url kan vara null. För antagna lagar kan "
-                "lagtexten ändå nås via retsinformationsurl eller via dk_sok_lovgivning."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "dok_id": {
-                        "type": "integer",
-                        "description": "Internt databas-id (matchar `dok_id`-fältet i dk_sok-resultat)",
-                    },
-                    "sagid": {
-                        "type": "integer",
-                        "description": "ODA sagid (matchar `sagid`-fältet i dk_sok_folketing-resultat)",
-                    },
-                    "max_tecken": {
-                        "type": "integer",
-                        "description": (
-                            "Teckentak för fulltexten (standard 60 000, 0 = hela texten). "
-                            "Danska lagtexter når nära en miljon tecken; utan tak "
-                            "riskerar anropet att överskrida svarsgränsen. Ett kapat svar "
-                            "bär trunkerad, tecken_totalt och fortsatt_fran_tecken."
-                        ),
-                        "default": 60000,
-                    },
-                    "fran_tecken": {
-                        "type": "integer",
-                        "description": "Börja texten vid denna teckenposition — för att läsa vidare.",
-                        "default": 0,
-                    },
-                },
-            },
-        ),
-        types.Tool(
-            name="dk_lista_perioder",
-            description=(
-                "Returnerar tillgängliga valperioder från Folketing ODA. "
-                "Period-ID-format: '20242' (fyrsiffrigt år + ettciffrigt löpnummer)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {},
-            },
-        ),
-        types.Tool(
-            name="dk_hamta_afstemning",
-            description=(
-                "Hämtar voteringsresultat för ett ärende (sag) via ODA. "
-                "Returnerar totalresultat (for/imod/hverken/fraværende) och "
-                "per-ledamot-röstning via Stemme-entiteten. "
-                "Navigerar via Sagstrin → Afstemning → Stemme. "
-                "OBS: Per-ledamot-svaret innehåller aktørid och typeid (1=For, 2=Imod, "
-                "3=Fravær, 4=Hverken) — inget namnuppslag sker automatiskt. "
-                "Slå upp aktørnamn och parti via ODA Aktør({aktørid}) vid behov."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sagid": {
-                        "type": "integer",
-                        "description": "ODA sagid för ärendet",
-                    },
-                    "inkludera_per_ledamot": {
-                        "type": "boolean",
-                        "description": "Inkludera per-ledamot-röstning (standard true)",
-                        "default": True,
-                    },
-                },
-                "required": ["sagid"],
-            },
-        ),
-        types.Tool(
-            name="dk_sok_semantisk",
-            description=(
-                "Semantisk sökning över hela den danska korpusen via pgvector (cosinus-likhet) — "
-                "returnerar topp-N olika dokument (avduplicerade på dok_id). "
-                "Använd detta verktyg för dokumentupptäckt på begreppsfrågor. "
-                "För sökning inom ett enskilt cachat dokument, använd dk_sok_i_dokument. "
-                "Kräver att 04_chunka_och_embedda.py körts och embeddings finns i databasen. "
-                "Modell: intfloat/multilingual-e5-base (768 dim). "
-                "Termexpansion körs inte här — vektorsökning hittar synonymer via semantisk likhet."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sokterm": {
-                        "type": "string",
-                        "description": "Sökfråga på danska (eller svenska/engelska) — formuleras som en mening för bäst resultat",
-                    },
-                    "max_traffar": {
-                        "type": "integer",
-                        "description": "Max antal resultat (standard 20)",
-                        "default": 20,
-                    },
-                },
-                "required": ["sokterm"],
-            },
-        ),
-        types.Tool(
-            name="dk_sok_i_dokument",
-            description=(
-                "Semantisk sökning inom ett enskilt cachat dokument via pgvector (cosinus-likhet). "
-                "Returnerar topp-N chunk-träffar sorterade efter relevans, med chunk_nr och text. "
-                "Använd när du behöver hitta specifika passager i ett dokument du redan identifierat "
-                "(t.ex. via dk_sok eller dk_sok_lovgivning). "
-                "dok_id är det interna databas-id:t som returneras av sökverktygen. "
-                "Kräver PostgreSQL med pgvector — SQLite-läge stöds inte. "
-                "Modell: intfloat/multilingual-e5-base (768 dim)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "dok_id": {
-                        "type": "integer",
-                        "description": "Internt databas-id för dokumentet (matchar dok_id-fältet i dk_sok-resultat)",
-                    },
-                    "fraga": {
-                        "type": "string",
-                        "description": "Sökfråga på danska (eller svenska/engelska) — formuleras som en mening eller fras för bäst resultat",
-                    },
-                    "max_treff": {
-                        "type": "integer",
-                        "description": "Max antal chunk-träffar att returnera (standard 5)",
-                        "default": 5,
-                    },
-                },
-                "required": ["dok_id", "fraga"],
-            },
-        ),
-        types.Tool(
-            name="dk_hamta_aktor",
-            description=(
-                "Hämtar metadata för en eller flera aktörer (ledamöter, ministrar, partier, "
-                "ministerier, utskott, m.fl.) från Folketing ODA via Aktør-entiteten. "
-                "Använd för att översätta aktørid:n från dk_hamta_afstemning till läsbara namn "
-                "och partitillhörighet. "
-                "Ange antingen aktorid (enskilt uppslag) eller aktorider (lista, batch-uppslag — "
-                "rekommenderas vid uppslag av många aktörer från en votering, t.ex. 179 ledamöter). "
-                "Returnerar typeid som anger aktörstyp (vanligast 1=Ministerium, 2=Folketinget, "
-                "3=Udvalg, 4=Folketingsgruppe/parti, 5=Person; andra typer förekommer och returneras "
-                "transparent — den kompletta listan finns i ODA-entiteten /Aktørtype), gruppenavnkort "
-                "(parti) och biografi-fält. "
-                "Anropas live mot ODA — ingen cache."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "aktorid": {
-                        "type": "integer",
-                        "description": "ODA aktørid för enskilt uppslag",
-                    },
-                    "aktorider": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Lista av ODA aktørid:n för batch-uppslag (t.ex. från dk_hamta_afstemning)",
-                    },
-                },
-            },
-        ),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Verktygsimplementationer
-# ---------------------------------------------------------------------------
-
-@server.call_tool()
-async def anropa_verktyg(namn: str, arguments: dict):
-    try:
-        if namn == "dk_sok":
-            return await _dk_sok(arguments)
-        elif namn == "dk_sok_folketing":
-            return await _dk_sok_folketing(arguments)
-        elif namn == "dk_sok_lovgivning":
-            return await _dk_sok_lovgivning(arguments)
-        elif namn == "dk_hamta_dokument":
-            return await _dk_hamta_dokument(arguments)
-        elif namn == "dk_lista_perioder":
-            return await _dk_lista_perioder(arguments)
-        elif namn == "dk_hamta_afstemning":
-            return await _dk_hamta_afstemning(arguments)
-        elif namn == "dk_sok_semantisk":
-            return await _dk_sok_semantisk(arguments)
-        elif namn == "dk_sok_i_dokument":
-            return await _dk_sok_i_dokument(arguments)
-        elif namn == "dk_hamta_aktor":
-            return await _dk_hamta_aktor(arguments)
-        else:
-            return [types.TextContent(type="text", text=f"Okänt verktyg: {namn}")]
-    except Exception as e:
-        logger.error("Fel i %s: %s", namn, e, exc_info=True)
-        return [types.TextContent(type="text", text=f"Fel: {e}")]
-
-
-def _formatera_treff(dok: dict) -> dict:
+def _formatera_treff(dok: dict) -> Traff:
     """
     Formaterar ett råt dokument-dict från DB för MCP-svar.
 
@@ -588,150 +605,173 @@ def _formatera_treff(dok: dict) -> dict:
     return treff
 
 
-async def _dk_sok(args: dict):
-    sokterm     = args["sokterm"]
-    typ         = args.get("typ")
-    periode     = args.get("periode")
-    max_traffar = int(args.get("max_traffar", 20))
-    expandera   = args.get("expandera", True)
+def _typ_matchar(dok: dict, typ: Optional[str]) -> bool:
+    """Jämför dokumenttyp skiftlägesokänsligt. NULL i databasen matchar aldrig ett filter."""
+    return not typ or (dok.get("typ") or "").lower() == typ.lower()
 
-    expansion = None
-    if expandera:
-        expansion = _expandera_fraga(sokterm)
-        effektiv_term = expansion
-    else:
-        effektiv_term = sokterm
 
-    # Hämta alla termer (kommaseparerade → OR-logik)
+@mcp.tool(title="Sök i alla danska källor", annotations=LASNING_DB)
+def dk_sok(
+    sokterm: Annotated[str, Field(description="Sökterm eller kommaseparerade termer (OR-logik), t.ex. 'klima, CO2, drivhusgas'")],
+    typ: Annotated[Optional[str], Field(description="Filtrera på dokumenttyp: 'lovforslag', 'lov', 'bekendtgorelse', 'betaenkning' m.fl.")] = None,
+    periode: Annotated[Optional[str], Field(description="Filtrera på valperiod, t.ex. '20242' (2024-25)")] = None,
+    max_traffar: Annotated[int, Field(description="Max antal resultat (standard 20)")] = 20,
+    expandera: Annotated[bool, Field(description="Expandera söktermen med juridisk terminologi (standard true)")] = True,
+) -> SokSvar:
+    """Söker i alla danska källor (Folketing ODA + Retsinformation) via lokal databas. Accepterar kommaseparerade söktermer (OR-logik). Stöder termexpansion till dansk parlamentarisk och juridisk terminologi."""
+    expansion = _expandera_fraga(sokterm) if expandera else None
+    effektiv_term = expansion if expansion is not None else sokterm
+
     termer = [t.strip() for t in effektiv_term.split(",") if t.strip()]
-    resultat = []
+    resultat: list[Traff] = []
     sett_ids = set()
-    for term in termer:
-        for dok in db.sok_dokument_fts(term, limit=max_traffar):
-            if dok["id"] not in sett_ids:
-                if typ and dok.get("typ", "").lower() != typ.lower():
+    with _som_toolerror("sökningen"):
+        for term in termer:
+            for dok in db.sok_dokument_fts(term, limit=max_traffar):
+                if dok["id"] in sett_ids:
+                    continue
+                if not _typ_matchar(dok, typ):
                     continue
                 if periode and dok.get("periode") != periode:
                     continue
                 sett_ids.add(dok["id"])
                 resultat.append(_formatera_treff(dok))
 
-    svar = {
+    return {
         "sokterm": sokterm,
         "expansion": expansion,
         "antal_traffar": len(resultat),
         "traffar": resultat[:max_traffar],
     }
-    return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
 
 
-async def _dk_sok_folketing(args: dict):
-    sokterm       = args["sokterm"]
-    typ           = args.get("typ")
-    periode       = args.get("periode")
-    paragrafnr    = args.get("paragrafnummer")
-    max_traffar   = int(args.get("max_traffar", 20))
-
+@mcp.tool(title="Sök i Folketingets ärenden", annotations=LASNING_DB)
+def dk_sok_folketing(
+    sokterm: Annotated[str, Field(description="Sökterm eller kommaseparerade termer")],
+    typ: Annotated[Optional[str], Field(description="Dokumenttyp: 'lovforslag', 'beslutningsforslag', 'foresporgsel', 'betaenkning'")] = None,
+    periode: Annotated[Optional[str], Field(description="Valperiod, t.ex. '20242'")] = None,
+    paragrafnummer: Annotated[Optional[str], Field(description="Filtrera på paragrafnummer, t.ex. '15' för § 15")] = None,
+    max_traffar: int = 20,
+) -> FolketingSvar:
+    """Söker i Folketing ODA — lovforslag, beslutningsforslag, betænkninger, forespørgsler. Sökning mot lokal databas (FTS + pgvector). Returnerar sagid, typ, titel, resume, paragrafnummer m.fl. Stöder filtrering på paragrafnummer för direkt §-koppling."""
     termer = [t.strip() for t in sokterm.split(",") if t.strip()]
-    resultat = []
+    resultat: list[Traff] = []
     sett_ids = set()
-    for term in termer:
-        for dok in db.sok_dokument_fts(term, limit=max_traffar * 2, kalla="oda"):
-            if dok["id"] not in sett_ids:
-                if typ and dok.get("typ", "").lower() != typ.lower():
+    with _som_toolerror("sökningen"):
+        for term in termer:
+            for dok in db.sok_dokument_fts(term, limit=max_traffar * 2, kalla="oda"):
+                if dok["id"] in sett_ids:
+                    continue
+                if not _typ_matchar(dok, typ):
                     continue
                 if periode and dok.get("periode") != periode:
                     continue
-                if paragrafnr and dok.get("paragrafnummer") != paragrafnr:
+                if paragrafnummer and dok.get("paragrafnummer") != paragrafnummer:
                     continue
                 sett_ids.add(dok["id"])
                 resultat.append(_formatera_treff(dok))
 
-    svar = {
+    return {
         "kalla": "Folketing ODA",
         "sokterm": sokterm,
         "antal_traffar": len(resultat),
         "traffar": resultat[:max_traffar],
     }
-    return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
 
 
-async def _dk_sok_lovgivning(args: dict):
-    sokterm              = args["sokterm"]
-    typ                  = args.get("typ")
-    max_traffar          = int(args.get("max_traffar", 20))
-    inkludera_historiska = bool(args.get("inkludera_historiska", False))
+@mcp.tool(title="Sök i dansk lagstiftning", annotations=LASNING_DB)
+def dk_sok_lovgivning(
+    sokterm: Annotated[str, Field(description="Sökterm eller kommaseparerade termer")],
+    typ: Annotated[Optional[str], Field(description="Lagtyp: 'lov', 'lovbekendtgorelse', 'bekendtgorelse', 'cirkular', 'vejledning'")] = None,
+    inkludera_historiska: Annotated[bool, Field(description="Inkludera historiska/upphävda lagar (HISTORISK). Sätt true endast om användaren explicit efterfrågar det.")] = False,
+    max_traffar: int = 20,
+) -> LovSvar:
+    """Söker i dansk lagstiftning från Retsinformation — love (LOV), lovbekendtgørelser (LBK), bekendtgørelser (BEK), cirkulærer (CIR), vejledninger (VEJ). Sökning mot lokal databas.
 
+    Som standard returneras endast GÆLDENDE (gällande) lagstiftning — dokument med status 'Valid' i Retsinformations Lex Dania-system. Historiska lagar (HISTORISK/notInForce) är upphävda och inte längre gällande rätt; de inkluderas inte i standardsökningen. Sätt inkludera_historiska=true om användaren explicit efterfrågar historiska eller upphävda regler. Historiska träffar markeras med historisk=true i svaret.
+    """
     termer = [t.strip() for t in sokterm.split(",") if t.strip()]
-    resultat = []
+    resultat: list[LovTraff] = []
     sett_ids = set()
-    for term in termer:
-        for dok in db.sok_dokument_fts(
-            term,
-            limit=max_traffar * 2,
-            kalla="retsinformation",
-            inkludera_ersatta=inkludera_historiska,
-        ):
-            if dok["id"] not in sett_ids:
-                if typ and dok.get("typ", "").lower() != typ.lower():
+    with _som_toolerror("sökningen"):
+        for term in termer:
+            for dok in db.sok_dokument_fts(
+                term,
+                limit=max_traffar * 2,
+                kalla="retsinformation",
+                inkludera_ersatta=inkludera_historiska,
+            ):
+                if dok["id"] in sett_ids:
+                    continue
+                if not _typ_matchar(dok, typ):
                     continue
                 sett_ids.add(dok["id"])
 
-                # Formatera träff — dölj giltig_till, exponera ikraftträdandedatum.
-                # `dok_id` matchar parameternamnet i dk_hamta_dokument(dok_id=...);
-                # `retsinformation_id` exponeras när källan har en ELI-id så att
-                # kedjning sök → hämta kan göras via extern identifierare också.
-                ar_historisk = dok.get("status") == "Historic"
-                treff = {
-                    "dok_id":           dok["id"],
-                    "beteckning":       dok.get("beteckning"),
-                    "typ":              dok.get("typ"),
-                    "titel":            dok.get("titel"),
-                    "titelkort":        dok.get("titelkort"),
+                # giltig_till döljs; ikraftträdandedatum exponeras. `dok_id`
+                # matchar parametern i dk_hamta_dokument, och
+                # `retsinformation_id` gör kedjning via extern identifierare möjlig.
+                treff: LovTraff = {
+                    "dok_id":               dok["id"],
+                    "beteckning":           dok.get("beteckning"),
+                    "typ":                  dok.get("typ"),
+                    "titel":                dok.get("titel"),
+                    "titelkort":            dok.get("titelkort"),
                     "ikrafttraedelsesdato": dok.get("datum"),
-                    "url":              dok.get("retsinformationsurl") or dok.get("url"),
-                    "lovnummer":        dok.get("lovnummer"),
-                    "resume":           dok.get("resume"),
+                    "url":                  dok.get("retsinformationsurl") or dok.get("url"),
+                    "lovnummer":            dok.get("lovnummer"),
+                    "resume":               dok.get("resume"),
                 }
                 if dok.get("extern_id"):
                     treff["retsinformation_id"] = dok["extern_id"]
-                if ar_historisk:
+                if dok.get("status") == "Historic":
                     treff["historisk"] = True
                     treff["advarsel"] = "Historisk lag — inte längre gällande rätt"
                 resultat.append(treff)
 
-    svar = {
+    return {
         "kalla": "Retsinformation",
         "sokterm": sokterm,
         "inkludera_historiska": inkludera_historiska,
         "antal_traffar": len(resultat[:max_traffar]),
         "traffar": resultat[:max_traffar],
     }
-    return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
 
 
-async def _dk_hamta_dokument(args: dict):
-    dok_id = args.get("dok_id")
-    sagid  = args.get("sagid")
-    max_tecken  = int(args.get("max_tecken", DK_MAX_TECKEN) or 0)
-    fran_tecken = int(args.get("fran_tecken", 0) or 0)
+@mcp.tool(title="Hämta danskt dokument eller ärende", annotations=LASNING_EXTERN)
+def dk_hamta_dokument(
+    dok_id: Annotated[Optional[int], Field(description="Internt databas-id (matchar `dok_id`-fältet i dk_sok-resultat)")] = None,
+    sagid: Annotated[Optional[int], Field(description="ODA sagid (matchar `sagid`-fältet i dk_sok_folketing-resultat)")] = None,
+    max_tecken: Annotated[int, Field(description=(
+        f"Teckentak för fulltexten (standard {DK_MAX_TECKEN}, högst {DK_MAX_TECKEN_TAK}; "
+        f"0 = så mycket som ryms, alltså {DK_MAX_TECKEN_TAK}). Danska lagtexter når nära "
+        "en miljon tecken och läses då i flera anrop. Ett kapat svar bär trunkerad, "
+        "tecken_totalt och fortsatt_fran_tecken."
+    ))] = DK_MAX_TECKEN,
+    fran_tecken: Annotated[int, Field(description="Börja texten vid denna teckenposition — för att läsa vidare.")] = 0,
+) -> Dokument | Sag:
+    """Hämtar fulltext och metadata för ett danskt dokument via dess interna id eller ODA sagid. Om fulltexten inte finns i cache hämtas PDF:en från ft.dk med curl-cffi och extraheras med pymupdf4llm. OBS: Vid sagid-uppslag returneras hela sagen plus listan över kopplade dokument (upp till 50). Äldre dokument (typiskt före 2015) saknar Fil-records i ODA, så fil_url kan vara null. För antagna lagar kan lagtexten ändå nås via retsinformationsurl eller via dk_sok_lovgivning."""
+    if max_tecken <= 0 or max_tecken > DK_MAX_TECKEN_TAK:
+        max_tecken = DK_MAX_TECKEN_TAK
+    fran_tecken = max(0, fran_tecken)
 
-    if dok_id is not None:
-        dok = db.hamta_dokument_med_id(int(dok_id))
-        if not dok:
-            return [types.TextContent(type="text", text=f"Dokument {dok_id} hittades inte i databasen.")]
-    elif sagid:
-        # sagid pekar alltid mot en sag i ODA — gå direkt till ODA och returnera
-        # sagen med dokumentlistan. Tidigare slogs detta först i lokal
-        # dokument-tabell på `extern_id`, men där lagras både dokumentid och
-        # sagid med samma kolumnnamn, vilket gav kollisioner där ett sagid
-        # råkade matcha extern_id för ett orelaterat dokument. Sagor hämtas
-        # alltid live från ODA — dokumentcachen påverkar inte den vägen.
-        return await _hamta_sag_fran_oda(int(sagid))
-    else:
-        return [types.TextContent(type="text", text="Ange dok_id eller sagid.")]
+    if dok_id is None:
+        if sagid:
+            # sagid pekar alltid mot en sag i ODA och hämtas live därifrån.
+            # Den lokala dokumenttabellen lagrar både dokumentid och sagid i
+            # extern_id, så ett uppslag där kunde kollidera med ett orelaterat
+            # dokument.
+            return _hamta_sag_fran_oda(sagid)
+        raise ToolError("Ange dok_id (från sökverktygen) eller sagid (från dk_sok_folketing).")
 
-    # Om fulltext saknas och det finns en URL — hämta PDF
+    with _som_toolerror(f"hämtning av dokument {dok_id}"):
+        dok = db.hamta_dokument_med_id(dok_id)
+    if not dok:
+        raise ToolError(
+            f"Dokument {dok_id} hittades inte i databasen. dok_id kommer ur "
+            "sökverktygen; ett ODA-ärende hämtas med sagid."
+        )
+
+    # Saknas fulltext men finns en URL hämtas PDF:en och sparas i databasen
     if not dok.get("fulltext_md") and dok.get("url"):
         logger.info("Hämtar PDF för dok %s: %s", dok.get("id"), dok.get("url"))
         pdf_bytes = _hamta_pdf_bytes(dok["url"])
@@ -739,7 +779,6 @@ async def _dk_hamta_dokument(args: dict):
             text = _extrahera_pdf_text(pdf_bytes)
             if text:
                 dok["fulltext_md"] = text
-                # Uppdatera databasen
                 try:
                     with db._cursor() as cur:
                         p = db._prefix()
@@ -751,9 +790,9 @@ async def _dk_hamta_dokument(args: dict):
                 except Exception as e:
                     logger.warning("Kunde inte spara fulltext: %s", e)
 
-    # Bygg svar — dölj giltig_till, exponera ikraftträdandedatum
-    svar = {
-        "id":                   dok.get("id"),
+    # giltig_till döljs; ikraftträdandedatum exponeras
+    svar: Dokument = {
+        "id":                   dok["id"],
         "kalla":                dok.get("kalla"),
         "beteckning":           dok.get("beteckning"),
         "typ":                  dok.get("typ"),
@@ -764,22 +803,23 @@ async def _dk_hamta_dokument(args: dict):
         "lovnummer":            dok.get("lovnummer"),
         "resume":               dok.get("resume"),
         "status":               dok.get("status"),
+        "fulltext_md":          None,
     }
 
     # Databasen har alltid hela texten — trunkeringen gäller bara svaret.
-    _utdrag = _skar_ut(dok.get("fulltext_md"), max_tecken, fran_tecken)
-    svar["fulltext_md"] = _utdrag["text"] if dok.get("fulltext_md") else None
     if dok.get("fulltext_md"):
-        svar["tecken_totalt"]        = _utdrag["tecken_totalt"]
-        svar["tecken_visade"]        = _utdrag["tecken_visade"]
-        svar["trunkerad"]            = _utdrag["trunkerad"]
-        svar["fortsatt_fran_tecken"] = _utdrag["fortsatt_fran_tecken"]
+        utdrag = _skar_ut(dok["fulltext_md"], max_tecken, fran_tecken)
+        svar["fulltext_md"]          = utdrag["text"]
+        svar["tecken_totalt"]        = utdrag["tecken_totalt"]
+        svar["tecken_visade"]        = utdrag["tecken_visade"]
+        svar["trunkerad"]            = utdrag["trunkerad"]
+        svar["fortsatt_fran_tecken"] = utdrag["fortsatt_fran_tecken"]
 
     if dok.get("status") == "Historic":
         svar["historisk"] = True
         svar["advarsel"] = "Historisk lag — inte längre gällande rätt"
 
-    # Slå upp ändringslagar från relations-tabellen
+    # Ändringslagar ur relationstabellen
     eli_url = dok.get("retsinformationsurl") or dok.get("url")
     if eli_url and dok.get("kalla") == "retsinformation":
         try:
@@ -804,245 +844,214 @@ async def _dk_hamta_dokument(args: dict):
         except Exception as e:
             logger.warning("Kunde inte hämta relationer för %s: %s", eli_url, e)
 
-    return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
+    return svar
 
 
-async def _hamta_sag_fran_oda(sagid: int):
+def _hamta_sag_fran_oda(sagid: int) -> Sag:
     """Hämtar ett ärende direkt från ODA (inte via cache)."""
-    try:
-        sag_data = _oda_get(f"Sag({sagid})")
+    with _som_toolerror(f"hämtning av sag {sagid}"):
+        try:
+            sag_data = _oda_get(f"Sag({sagid})")
+        except httpx.HTTPStatusError as fel:
+            if fel.response.status_code == 404:
+                raise ToolError(f"Ärendet med sagid {sagid} finns inte i ODA.") from fel
+            raise
         sag = sag_data.get("value", sag_data)
 
-        # Hämta kopplade dokument via SagDokument-relationen.
-        # Höjt från tidigare tak om 3 dokument till 50 så hela ärendetråden
-        # (lovforslag, betænkninger, ændringsforslag, slutligt antagen lov)
-        # kommer med — nödvändigt för komparativ utredning där hela processen
-        # är intressant.
+        # Upp till 50 kopplade dokument, så att hela ärendetråden kommer med
+        # (lovforslag, betænkninger, ændringsforslag, slutligt antagen lov).
         sd_data = _oda_get("SagDokument", {"$filter": f"sagid eq {sagid}", "$top": "50"})
-        dokument_lista = []
-        for sd in sd_data.get("value", []):
-            dok_id_oda = sd.get("dokumentid")
-            if not dok_id_oda:
-                continue
-            try:
-                dok_data = _oda_get(f"Dokument({dok_id_oda})")
-                dok = dok_data.get("value", dok_data)
-                # Hämta fil-URL
-                fil_data = _oda_get("Fil", {"$filter": f"dokumentid eq {dok_id_oda}", "$top": "1"})
-                filer = fil_data.get("value", [])
-                fil_url = filer[0].get("filurl") if filer else None
-                dokument_lista.append({
-                    "dokumentid": dok_id_oda,
-                    "titel":      dok.get("titel"),
-                    # typeid låter användaren särskilja lovforslag, betænkning,
-                    # ændringsforslag, lovvedtagelse osv. — nödvändigt för att
-                    # tråda processen rätt.
-                    "typeid":     dok.get("typeid"),
-                    "dato":       dok.get("dato"),
-                    "fil_url":    fil_url,
-                })
-            except Exception as e:
-                logger.warning("Kunde inte hämta dokument %s: %s", dok_id_oda, e)
 
-        svar = {
-            "sagid": sagid,
-            "beteckning": sag.get("nummer"),
-            "titel": sag.get("titel"),
-            "titelkort": sag.get("titelkort"),
-            "typeid": sag.get("typeid"),
-            "statusid": sag.get("statusid"),
-            "periodeid": sag.get("periodeid"),
-            "resume": sag.get("resume") or None,
-            "afstemningskonklusion": sag.get("afstemningskonklusion") or None,
-            "lovnummer": sag.get("lovnummer") or None,
-            "retsinformationsurl": sag.get("retsinformationsurl") or None,
-            "paragrafnummer": str(sag.get("paragrafnummer") or "").strip() or None,
-            "paragraf": sag.get("paragraf") or None,
-            "afgoerelse": sag.get("afgørelse") or None,
-            "begrundelse": sag.get("begrundelse") or None,
-            "baggrundsmateriale": sag.get("baggrundsmateriale") or None,
-            "dokument": dokument_lista,
-        }
-        return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"Fel vid hämtning av sag {sagid}: {e}")]
+    dokument_lista: list[SagDokument] = []
+    for sd in sd_data.get("value", []):
+        dok_id_oda = sd.get("dokumentid")
+        if not dok_id_oda:
+            continue
+        try:
+            dok_data = _oda_get(f"Dokument({dok_id_oda})")
+            dok = dok_data.get("value", dok_data)
+            fil_data = _oda_get("Fil", {"$filter": f"dokumentid eq {dok_id_oda}", "$top": "1"})
+            filer = fil_data.get("value", [])
+            fil_url = filer[0].get("filurl") if filer else None
+            dokument_lista.append({
+                "dokumentid": dok_id_oda,
+                "titel":      dok.get("titel"),
+                # typeid skiljer lovforslag, betænkning, ændringsforslag,
+                # lovvedtagelse osv. — nödvändigt för att tråda processen rätt.
+                "typeid":     dok.get("typeid"),
+                "dato":       dok.get("dato"),
+                "fil_url":    fil_url,
+            })
+        except Exception as e:
+            logger.warning("Kunde inte hämta dokument %s: %s", dok_id_oda, e)
+
+    return {
+        "sagid": sagid,
+        "beteckning": sag.get("nummer"),
+        "titel": sag.get("titel"),
+        "titelkort": sag.get("titelkort"),
+        "typeid": sag.get("typeid"),
+        "statusid": sag.get("statusid"),
+        "periodeid": sag.get("periodeid"),
+        "resume": sag.get("resume") or None,
+        "afstemningskonklusion": sag.get("afstemningskonklusion") or None,
+        "lovnummer": sag.get("lovnummer") or None,
+        "retsinformationsurl": sag.get("retsinformationsurl") or None,
+        "paragrafnummer": str(sag.get("paragrafnummer") or "").strip() or None,
+        "paragraf": sag.get("paragraf") or None,
+        "afgoerelse": sag.get("afgørelse") or None,
+        "begrundelse": sag.get("begrundelse") or None,
+        "baggrundsmateriale": sag.get("baggrundsmateriale") or None,
+        "dokument": dokument_lista,
+    }
 
 
-async def _dk_lista_perioder(args: dict):
-    try:
+@mcp.tool(title="Lista Folketingets valperioder", annotations=LASNING_EXTERN)
+def dk_lista_perioder() -> list[Periode]:
+    """Returnerar tillgängliga valperioder från Folketing ODA. Period-ID-format: '20242' (fyrsiffrigt år + ettciffrigt löpnummer)."""
+    with _som_toolerror("hämtning av perioder"):
         data = _oda_get("Periode", {"$orderby": "id desc", "$top": "20"})
-        perioder = [
-            {
-                "id": p.get("id"),
-                "kod": p.get("kode"),
-                "titel": p.get("titel"),
-                "startdatum": p.get("startdato"),
-                "slutdatum": p.get("slutdato"),
-            }
-            for p in data.get("value", [])
-        ]
-        return [types.TextContent(type="text", text=json.dumps(perioder, ensure_ascii=False, indent=2))]
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"Fel vid hämtning av perioder: {e}")]
-
-
-async def _dk_hamta_afstemning(args: dict):
-    sagid                = int(args["sagid"])
-    inkludera_per_ledamot = args.get("inkludera_per_ledamot", True)
-
-    try:
-        # Steg 1: hämta sagstrin
-        st_data = _oda_get("Sagstrin", {"$filter": f"sagid eq {sagid}", "$format": "json"})
-        sagstrin_lista = st_data.get("value", [])
-
-        if not sagstrin_lista:
-            return [types.TextContent(type="text", text=f"Inga sagstrin hittades för sagid {sagid}.")]
-
-        afstemningar = []
-        for strin in sagstrin_lista:
-            strinid = strin.get("id")
-            strintyp = strin.get("typeid")
-
-            # Steg 2: hämta afstemning för detta sagstrin
-            try:
-                af_data = _oda_get("Afstemning", {"$filter": f"sagstrinid eq {strinid}"})
-                for af in af_data.get("value", []):
-                    afstemningid = af.get("id")
-                    afstemning_post = {
-                        "afstemningid": afstemningid,
-                        "sagstrinid": strinid,
-                        "sagstrin_typeid": strintyp,
-                        "konklusion": af.get("konklusion"),
-                        "for": af.get("for"),
-                        "imod": af.get("imod"),
-                        "hverken": af.get("hverken"),
-                        "fravaerende": af.get("fravaerende"),
-                        "vedtaget": af.get("vedtaget"),
-                    }
-
-                    # Steg 3: per-ledamot om begärt
-                    if inkludera_per_ledamot and afstemningid:
-                        try:
-                            stemme_data = _oda_get(
-                                "Stemme",
-                                {"$filter": f"afstemningid eq {afstemningid}", "$top": "500"}
-                            )
-                            stemmer = [
-                                {
-                                    "aktørid": s.get("aktørid"),
-                                    "typeid": s.get("typeid"),
-                                    # 1=For, 2=Imod, 3=Fravær, 4=Hverken
-                                }
-                                for s in stemme_data.get("value", [])
-                            ]
-                            afstemning_post["stemmer"] = stemmer
-                        except Exception as e:
-                            logger.warning("Stemme-hämtning misslyckades (afstemningid=%s): %s", afstemningid, e)
-                            afstemning_post["stemmer"] = []
-
-                    afstemningar.append(afstemning_post)
-            except Exception as e:
-                logger.warning("Afstemning-hämtning misslyckades (sagstrinid=%s): %s", strinid, e)
-
-        svar = {
-            "sagid": sagid,
-            "antal_afstemninger": len(afstemningar),
-            "afstemninger": afstemningar,
+    return [
+        {
+            "id": p.get("id"),
+            "kod": p.get("kode"),
+            "titel": p.get("titel"),
+            "startdatum": p.get("startdato"),
+            "slutdatum": p.get("slutdato"),
         }
-        return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
-
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"Fel vid hämtning av afstemning för sagid {sagid}: {e}")]
+        for p in data.get("value", [])
+    ]
 
 
-async def _dk_sok_semantisk(args: dict):
-    sokterm     = args["sokterm"]
-    max_traffar = int(args.get("max_traffar", 20))
+@mcp.tool(title="Hämta voteringsresultat för ett ärende", annotations=LASNING_EXTERN)
+def dk_hamta_afstemning(
+    sagid: Annotated[int, Field(description="ODA sagid för ärendet")],
+    inkludera_per_ledamot: Annotated[bool, Field(description="Inkludera per-ledamot-röstning (standard true)")] = True,
+) -> AfstemningSvar:
+    """Hämtar voteringsresultat för ett ärende (sag) via ODA. Returnerar totalresultat (for/imod/hverken/fraværende) och per-ledamot-röstning via Stemme-entiteten. Navigerar via Sagstrin → Afstemning → Stemme. OBS: Per-ledamot-svaret innehåller aktørid och typeid (1=For, 2=Imod, 3=Fravær, 4=Hverken) — inget namnuppslag sker automatiskt. Slå upp aktørnamn och parti via ODA Aktør({aktørid}) vid behov."""
+    with _som_toolerror(f"hämtning av sagstrin för sagid {sagid}"):
+        st_data = _oda_get("Sagstrin", {"$filter": f"sagid eq {sagid}"})
+    sagstrin_lista = st_data.get("value", [])
+    if not sagstrin_lista:
+        raise ToolError(
+            f"Inga sagstrin hittades för sagid {sagid}. Kontrollera sagid med "
+            "dk_sok_folketing; ärenden utan behandling i salen har inga voteringar."
+        )
 
+    afstemningar: list[Afstemning] = []
+    for strin in sagstrin_lista:
+        strinid = strin.get("id")
+        try:
+            af_data = _oda_get("Afstemning", {"$filter": f"sagstrinid eq {strinid}"})
+        except Exception as e:
+            logger.warning("Afstemning-hämtning misslyckades (sagstrinid=%s): %s", strinid, e)
+            continue
+        for af in af_data.get("value", []):
+            afstemningid = af.get("id")
+            post: Afstemning = {
+                "afstemningid": afstemningid,
+                "sagstrinid": strinid,
+                "sagstrin_typeid": strin.get("typeid"),
+                "konklusion": af.get("konklusion"),
+                "for": af.get("for"),
+                "imod": af.get("imod"),
+                "hverken": af.get("hverken"),
+                "fravaerende": af.get("fravaerende"),
+                "vedtaget": af.get("vedtaget"),
+            }
+            if inkludera_per_ledamot and afstemningid:
+                try:
+                    stemme_data = _oda_get(
+                        "Stemme",
+                        {"$filter": f"afstemningid eq {afstemningid}", "$top": "500"},
+                    )
+                    # typeid: 1=For, 2=Imod, 3=Fravær, 4=Hverken
+                    post["stemmer"] = [
+                        {"aktørid": s.get("aktørid"), "typeid": s.get("typeid")}
+                        for s in stemme_data.get("value", [])
+                    ]
+                except Exception as e:
+                    logger.warning("Stemme-hämtning misslyckades (afstemningid=%s): %s", afstemningid, e)
+                    post["stemmer"] = []
+            afstemningar.append(post)
+
+    return {
+        "sagid": sagid,
+        "antal_afstemninger": len(afstemningar),
+        "afstemninger": afstemningar,
+    }
+
+
+@mcp.tool(title="Semantisk sökning i dansk korpus", annotations=LASNING_DB)
+def dk_sok_semantisk(
+    sokterm: Annotated[str, Field(description="Sökfråga på danska (eller svenska/engelska) — formuleras som en mening för bäst resultat")],
+    max_traffar: Annotated[int, Field(description="Max antal resultat (standard 20)")] = 20,
+) -> SemantiskSvar:
+    """Semantisk sökning över hela den danska korpusen via pgvector (cosinus-likhet) — returnerar topp-N olika dokument (avduplicerade på dok_id). Använd detta verktyg för dokumentupptäckt på begreppsfrågor. För sökning inom ett enskilt cachat dokument, använd dk_sok_i_dokument. Kräver att 04_chunka_och_embedda.py körts och embeddings finns i databasen. Modell: intfloat/multilingual-e5-base (768 dim). Termexpansion körs inte här — vektorsökning hittar synonymer via semantisk likhet."""
     if not db._ar_postgres():
-        return [types.TextContent(
-            type="text",
-            text="Semantisk sökning kräver PostgreSQL med pgvector — SQLite-läge stöds inte."
-        )]
+        raise ToolError(_SQLITE_EJ_VEKTOR)
 
-    try:
-        fn = _hamta_semantisk_sok()
-        resultat = fn(sokterm, limit=max_traffar)
-    except Exception as e:
-        logger.error("Semantisk sökning misslyckades: %s", e, exc_info=True)
-        return [types.TextContent(type="text", text=f"Semantisk sökning misslyckades: {e}")]
+    with _som_toolerror("den semantiska sökningen"):
+        resultat = _hamta_chunka_modul().semantisk_sok(sokterm, limit=max_traffar)
 
     if not resultat:
-        return [types.TextContent(
-            type="text",
-            text="Inga semantiska träffar. Kontrollera att 04_chunka_och_embedda.py körts och att embeddings finns i databasen."
-        )]
+        raise ToolError(
+            "Inga semantiska träffar. Embeddings saknas troligen i databasen; "
+            "kör 04_chunka_och_embedda.py."
+        )
 
-    svar = {
+    return {
         "sokterm": sokterm,
         "metod": "pgvector cosinus-likhet (intfloat/multilingual-e5-base, 768 dim)",
         "antal_traffar": len(resultat),
         "traffar": resultat,
     }
-    return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
 
 
-async def _dk_sok_i_dokument(args: dict):
-    dok_id    = int(args["dok_id"])
-    fraga     = args["fraga"]
-    max_treff = int(args.get("max_treff", 5))
-
+@mcp.tool(title="Semantisk sökning i ett dokument", annotations=LASNING_DB)
+def dk_sok_i_dokument(
+    dok_id: Annotated[int, Field(description="Internt databas-id för dokumentet (matchar dok_id-fältet i dk_sok-resultat)")],
+    fraga: Annotated[str, Field(description="Sökfråga på danska (eller svenska/engelska) — formuleras som en mening eller fras för bäst resultat")],
+    max_treff: Annotated[int, Field(description="Max antal chunk-träffar att returnera (standard 5)")] = 5,
+) -> SokIDokumentSvar:
+    """Semantisk sökning inom ett enskilt cachat dokument via pgvector (cosinus-likhet). Returnerar topp-N chunk-träffar sorterade efter relevans, med chunk_nr och text. Använd när du behöver hitta specifika passager i ett dokument du redan identifierat (t.ex. via dk_sok eller dk_sok_lovgivning). dok_id är det interna databas-id:t som returneras av sökverktygen. Kräver PostgreSQL med pgvector — SQLite-läge stöds inte. Modell: intfloat/multilingual-e5-base (768 dim)."""
     if not db._ar_postgres():
-        return [types.TextContent(
-            type="text",
-            text="Semantisk sökning kräver PostgreSQL med pgvector — SQLite-läge stöds inte."
-        )]
+        raise ToolError(_SQLITE_EJ_VEKTOR)
 
-    try:
-        fn = _hamta_semantisk_sok_i_dokument()
-        resultat = fn(dok_id, fraga, limit=max_treff)
-    except Exception as e:
-        logger.error("dk_sok_i_dokument misslyckades: %s", e, exc_info=True)
-        return [types.TextContent(type="text", text=f"Inom-dokument-sökning misslyckades: {e}")]
+    with _som_toolerror(f"sökningen i dokument {dok_id}"):
+        resultat = _hamta_chunka_modul().semantisk_sok_i_dokument(dok_id, fraga, limit=max_treff)
 
-    # semantisk_sok_i_dokument returnerar metadata + ev. fel-fält som dict
-    return [types.TextContent(type="text", text=json.dumps(resultat, ensure_ascii=False, indent=2))]
+    # semantisk_sok_i_dokument signalerar okänt dokument och saknade chunks med ett fel-fält
+    if "fel" in resultat:
+        raise ToolError(resultat["fel"])
+    return resultat
 
 
-async def _dk_hamta_aktor(args: dict):
-    aktorid   = args.get("aktorid")
-    aktorider = args.get("aktorider")
-
+@mcp.tool(title="Hämta aktör ur Folketingets data", annotations=LASNING_EXTERN)
+def dk_hamta_aktor(
+    aktorid: Annotated[Optional[int], Field(description="ODA aktørid för enskilt uppslag")] = None,
+    aktorider: Annotated[Optional[list[int]], Field(description="Lista av ODA aktørid:n för batch-uppslag (t.ex. från dk_hamta_afstemning)")] = None,
+) -> Aktor | AktorBatch:
+    """Hämtar metadata för en eller flera aktörer (ledamöter, ministrar, partier, ministerier, utskott, m.fl.) från Folketing ODA via Aktør-entiteten. Använd för att översätta aktørid:n från dk_hamta_afstemning till läsbara namn och partitillhörighet. Ange antingen aktorid (enskilt uppslag) eller aktorider (lista, batch-uppslag — rekommenderas vid uppslag av många aktörer från en votering, t.ex. 179 ledamöter). Returnerar typeid som anger aktörstyp (vanligast 1=Ministerium, 2=Folketinget, 3=Udvalg, 4=Folketingsgruppe/parti, 5=Person; andra typer förekommer och returneras transparent — den kompletta listan finns i ODA-entiteten /Aktørtype), gruppenavnkort (parti) och biografi-fält. Anropas live mot ODA — ingen cache."""
     if aktorid is None and not aktorider:
-        return [types.TextContent(
-            type="text",
-            text="Ange antingen aktorid (enskilt uppslag) eller aktorider (lista för batch-uppslag)."
-        )]
+        raise ToolError("Ange antingen aktorid (enskilt uppslag) eller aktorider (lista för batch-uppslag).")
     if aktorid is not None and aktorider:
-        return [types.TextContent(
-            type="text",
-            text="Ange antingen aktorid eller aktorider, inte båda."
-        )]
+        raise ToolError("Ange antingen aktorid eller aktorider, inte båda.")
 
-    if aktorid is not None:
-        ids = [int(aktorid)]
-    else:
-        ids = [int(i) for i in aktorider]
-        if not ids:
-            return [types.TextContent(type="text", text="aktorider är tom — inga id:n att slå upp.")]
+    ids = [aktorid] if aktorid is not None else list(aktorider)
 
-    aktorer = []
-    fel = []
+    aktorer: list[Aktor] = []
+    fel: list[AktorBatchFel] = []
 
-    # ODA $filter har URL-längdgränser (~2000 tecken). Batcha i grupper om 50
-    # — "id eq 99999 or " är ~15 tecken, så 50 ger marginal under gränsen.
+    # ODA:s $filter har en URL-längdgräns (~2000 tecken). "id eq 99999 or "
+    # är ~15 tecken, så 50 per anrop ger marginal.
     BATCH = 50
     for start in range(0, len(ids), BATCH):
         batch = ids[start:start + BATCH]
         filter_uttryck = " or ".join(f"id eq {aid}" for aid in batch)
         try:
             data = _oda_get("Aktør", {"$filter": filter_uttryck, "$top": str(BATCH)})
-        except Exception as e:
+        except (httpx.HTTPError, ValueError) as e:
             logger.warning("Aktör-batch %s misslyckades: %s", batch, e)
             fel.append({"batch": batch, "fel": str(e)})
             continue
@@ -1050,9 +1059,9 @@ async def _dk_hamta_aktor(args: dict):
         for rad in data.get("value", []):
             aktorer.append({
                 "aktørid":          rad.get("id"),
-                "typeid":           rad.get("typeid"),
                 # 1=Ministerium, 2=Folketinget, 3=Udvalg,
                 # 4=Folketingsgruppe (parti), 5=Person
+                "typeid":           rad.get("typeid"),
                 "navn":             rad.get("navn"),
                 "fornavn":          rad.get("fornavn"),
                 "efternavn":        rad.get("efternavn"),
@@ -1063,77 +1072,38 @@ async def _dk_hamta_aktor(args: dict):
                 "opdateringsdato":  rad.get("opdateringsdato"),
             })
 
-    # Enskilt uppslag — returnera objektet direkt så svaret blir lätt att läsa
+    # Enskilt uppslag — objektet direkt, så att svaret blir lätt att läsa
     if aktorid is not None:
+        if fel:
+            raise ToolError(
+                f"Folketingets ODA gick inte att fråga om aktørid={aktorid}: {fel[0]['fel']}. "
+                "Försök igen senare."
+            )
         if not aktorer:
-            return [types.TextContent(
-                type="text",
-                text=f"Ingen aktör hittades med aktørid={aktorid}."
-            )]
-        return [types.TextContent(
-            type="text",
-            text=json.dumps(aktorer[0], ensure_ascii=False, indent=2)
-        )]
+            raise ToolError(f"Ingen aktör hittades med aktørid={aktorid}.")
+        return aktorer[0]
 
-    # Batch-uppslag — returnera lista plus räknare så användaren ser om något saknas
-    svar = {
+    # Batch-uppslag — lista plus räknare, så att det syns om något saknas
+    svar: AktorBatch = {
         "begart_antal":     len(ids),
         "returnerat_antal": len(aktorer),
         "aktorer":          aktorer,
     }
     if fel:
         svar["fel"] = fel
-    return [types.TextContent(type="text", text=json.dumps(svar, ensure_ascii=False, indent=2))]
+    return svar
 
 
 # ---------------------------------------------------------------------------
 # Start
 # ---------------------------------------------------------------------------
 
-async def _starta_server():
-    if MCP_TRANSPORT == "http":
-        from starlette.applications import Starlette
-        from starlette.routing import Route
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.responses import Response
-        from mcp.server.sse import SseServerTransport
-        import uvicorn
-
-        class ApiNyckelMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request, anropa_nasta):
-                if MCP_API_KEY:
-                    auth = request.headers.get("Authorization", "")
-                    if auth != f"Bearer {MCP_API_KEY}":
-                        return Response("Ej auktoriserad", status_code=401)
-                return await anropa_nasta(request)
-
-        sse = SseServerTransport("/messages/")
-
-        async def hantera_sse(request):
-            async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-                await server.run(streams[0], streams[1], server.create_initialization_options())
-
-        app = Starlette(
-            middleware=[ApiNyckelMiddleware],
-            routes=[Route("/sse", endpoint=hantera_sse)],
-        )
-        logger.info("Startar HTTP-server på %s:%s", MCP_HOST, MCP_PORT)
-        await uvicorn.Server(uvicorn.Config(app, host=MCP_HOST, port=MCP_PORT)).serve()
-    else:
-        logger.info("Startar stdio-server (Danmark MCP)")
-        async with stdio_server() as (las, skriv):
-            await server.run(las, skriv, server.create_initialization_options())
+def _initiera() -> None:
+    """Initierar databasschemat. Fel fångas av starta(), så att servern går
+    upp även när Postgres är nere; verktygsanropen felar då begripligt."""
+    db.initialisera_schema()
+    logger.info("Databasschema initialiserat (schema: danmark)")
 
 
 if __name__ == "__main__":
-    import asyncio
-    # Databasinitiering: fel loggas men kraschar inte servern. Detta gör att
-    # MCP-servern startar även om PostgreSQL-containern råkar vara nere vid
-    # Claude Desktops uppstart. Verktygsanrop kommer att fela tills DB är uppe,
-    # men servern överlever och behöver inte startas om manuellt.
-    try:
-        db.initialisera_schema()
-        logger.info("Databasschema initialiserat (schema: danmark)")
-    except Exception as e:
-        logger.warning("Databasinitiering misslyckades: %s — fortsätter utan DB", e)
-    asyncio.run(_starta_server())
+    starta(mcp, standardport=8714, initiera=_initiera, forvarm_http=_forvarm_embedding)
