@@ -124,10 +124,10 @@ def _hamta_modell():
                 with tysta_fd(_LOG_DIR / "modell_laddning.log"):
                     from sentence_transformers import SentenceTransformer
                     modell = SentenceTransformer(EMBEDDING_MODELL)
-                logger.info(
-                    "Modell laddad. Vektordimension: %d",
-                    modell.get_sentence_embedding_dimension(),
-                )
+                # Metoden bytte namn i sentence-transformers 6; båda namnen stöds
+                dimension = getattr(modell, "get_embedding_dimension", None) \
+                    or modell.get_sentence_embedding_dimension
+                logger.info("Modell laddad. Vektordimension: %d", dimension())
                 _modell = modell
     return _modell
 
