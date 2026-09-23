@@ -55,6 +55,22 @@ Daglig synk installeras med:
 python3 02_synka_oda.py --installera-schema
 ```
 
+## Semantisk sökning och vektorindex
+
+`dk_sok_semantisk` väljer varje dokuments närmaste chunk och sorterar
+dokumenten efter cosinusavstånd. Schemat skapar inget vektorindex på
+`danmark.embeddings`, så varje sökning jämför frågan med samtliga chunks
+(ett halvt miljon rader tar några sekunder). Ett HNSW-index snabbar upp
+sökningen men tar tid och minne att bygga, och skapas därför bara som ett
+medvetet val:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_emb_hnsw ON danmark.embeddings
+    USING hnsw (vektor vector_cosine_ops);
+```
+
+Med indexet blir sökningen ungefärlig i stället för exakt.
+
 ## Transport: stdio eller http
 
 Transporten väljs med `MCP_TRANSPORT` i `.env`. Båda är likvärdiga val.

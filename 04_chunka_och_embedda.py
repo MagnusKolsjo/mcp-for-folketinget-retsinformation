@@ -278,17 +278,24 @@ def semantisk_sok(sokterm: str, limit: int = 20) -> list[dict]:
     vektor = _generera_embeddings([sokterm])[0]
     p = db._prefix()
 
+    # DISTINCT ON kräver att sorteringen börjar på dok_id. Den inre frågan
+    # väljer därför dokumentets närmaste chunk, och den yttre sorterar
+    # dokumenten efter avstånd. Utan den yttre sorteringen blir resultatet
+    # de dokument som har lägst id, inte de mest relevanta.
     with db._cursor() as cur:
         cur.execute(
-            f"""SELECT DISTINCT ON (c.dok_id)
-                    d.id, d.kalla, d.beteckning, d.typ, d.titel, d.titelkort,
-                    d.periode, d.datum, d.url, d.retsinformationsurl,
-                    d.lovnummer, d.resume, d.paragrafnummer,
-                    (e.vektor <=> %s::vector) AS avstand
-                FROM {p}embeddings e
-                JOIN {p}chunks c ON c.id = e.chunk_id
-                JOIN {p}dokument d ON d.id = c.dok_id
-                ORDER BY c.dok_id, avstand ASC
+            f"""SELECT * FROM (
+                    SELECT DISTINCT ON (c.dok_id)
+                        d.id, d.kalla, d.beteckning, d.typ, d.titel, d.titelkort,
+                        d.periode, d.datum, d.url, d.retsinformationsurl,
+                        d.lovnummer, d.resume, d.paragrafnummer,
+                        (e.vektor <=> %s::vector) AS avstand
+                    FROM {p}embeddings e
+                    JOIN {p}chunks c ON c.id = e.chunk_id
+                    JOIN {p}dokument d ON d.id = c.dok_id
+                    ORDER BY c.dok_id, avstand ASC
+                ) narmaste_per_dokument
+                ORDER BY avstand ASC
                 LIMIT %s""",
             (str(vektor), limit)
         )

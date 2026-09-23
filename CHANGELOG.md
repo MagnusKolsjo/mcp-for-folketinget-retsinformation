@@ -44,6 +44,8 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- `dk_sok_semantisk` sorterar träffarna efter avstånd. Tidigare gav den
+  de dokument som hade lägst id, oavsett hur väl de matchade frågan.
 - Lat inläsning av embeddingmodellen och av chunkmodulen är trådsäker.
 - Omdirigeringen av fd 1 och 2 under pymupdf- och embeddinganrop är
   serialiserad, så att samtidiga anrop inte lämnar stdout och stderr pekande
