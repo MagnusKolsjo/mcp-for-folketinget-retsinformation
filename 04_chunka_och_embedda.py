@@ -17,6 +17,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -38,6 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 import db
+from tyst_fd import tysta_fd
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -99,56 +101,42 @@ def _chunka_text(text: str, storlek: int = CHUNK_STORLEK, overlapp: int = CHUNK_
 
 
 # ---------------------------------------------------------------------------
-# Embedding-modell (lazy-laddning)
+# Embedding-modell (lat inläsning)
 # ---------------------------------------------------------------------------
 
 _modell = None
+_modell_las = threading.Lock()
 
 
 def _hamta_modell():
-    """Laddar embeddingmodellen vid första anropet."""
+    """Laddar embeddingmodellen vid första anropet.
+
+    MCP-servern anropar funktionen från flera arbetstrådar. Dubbelkontrollerad
+    låsning gör att bara en tråd laddar modellen; övriga väntar på låset och
+    ser sedan den färdiga modellen. Efter första inläsningen tas låset aldrig.
+    """
     global _modell
     if _modell is None:
-        logger.info("Laddar embeddingmodell: %s", EMBEDDING_MODELL)
-        import contextlib, os
-        # Tysta tqdm och eventuell FD1-output från sentence-transformers
-        log_vag = str(_LOG_DIR / "modell_laddning.log")
-        save_out = os.dup(1)
-        save_err = os.dup(2)
-        log_fd = os.open(log_vag, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-        try:
-            os.dup2(log_fd, 1)
-            os.dup2(log_fd, 2)
-            from sentence_transformers import SentenceTransformer
-            _modell = SentenceTransformer(EMBEDDING_MODELL)
-        finally:
-            os.dup2(save_out, 1)
-            os.dup2(save_err, 2)
-            os.close(save_out)
-            os.close(save_err)
-            os.close(log_fd)
-        logger.info("Modell laddad. Vektordimension: %d", _modell.get_sentence_embedding_dimension())
+        with _modell_las:
+            if _modell is None:
+                logger.info("Laddar embeddingmodell: %s", EMBEDDING_MODELL)
+                # tqdm och sentence-transformers skriver förbi sys.stdout
+                with tysta_fd(_LOG_DIR / "modell_laddning.log"):
+                    from sentence_transformers import SentenceTransformer
+                    modell = SentenceTransformer(EMBEDDING_MODELL)
+                logger.info(
+                    "Modell laddad. Vektordimension: %d",
+                    modell.get_sentence_embedding_dimension(),
+                )
+                _modell = modell
     return _modell
 
 
 def _generera_embeddings(texter: list[str]) -> list[list[float]]:
     """Genererar embeddings för en lista texter."""
     modell = _hamta_modell()
-    import os
-    log_vag = str(_LOG_DIR / "embedding.log")
-    save_out = os.dup(1)
-    save_err = os.dup(2)
-    log_fd = os.open(log_vag, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.dup2(log_fd, 1)
-        os.dup2(log_fd, 2)
+    with tysta_fd(_LOG_DIR / "embedding.log"):
         vektorer = modell.encode(texter, batch_size=BATCH_STORLEK, show_progress_bar=False)
-    finally:
-        os.dup2(save_out, 1)
-        os.dup2(save_err, 2)
-        os.close(save_out)
-        os.close(save_err)
-        os.close(log_fd)
     return vektorer.tolist()
 
 

@@ -13,7 +13,7 @@ import os
 import sys
 import json
 import logging
-import contextlib
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -71,23 +71,31 @@ def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
     }
 
 import db
+from tyst_fd import tysta_fd
 import importlib.util as _iutil, pathlib as _pl
 
 # Lazy-import av hela chunka/embedda-modulen. Filnamnet börjar med en siffra
 # och kan inte importeras direkt — importlib används istället. Modulen laddas
 # en gång och cachas; därefter exponeras enskilda funktioner via wrappers.
 _chunka_modul = None
+_chunka_modul_las = threading.Lock()
 
 
 def _hamta_chunka_modul():
-    """Laddar 04_chunka_och_embedda.py och returnerar modulobjektet (lazy)."""
+    """Laddar 04_chunka_och_embedda.py och returnerar modulobjektet (lazy).
+
+    Dubbelkontrollerad låsning: två samtidiga verktygsanrop får samma
+    modulobjekt och därmed samma embeddingmodell.
+    """
     global _chunka_modul
     if _chunka_modul is None:
-        modul_vag = _pl.Path(__file__).parent / "04_chunka_och_embedda.py"
-        spec = _iutil.spec_from_file_location("chunka_embedda", modul_vag)
-        modul = _iutil.module_from_spec(spec)
-        spec.loader.exec_module(modul)
-        _chunka_modul = modul
+        with _chunka_modul_las:
+            if _chunka_modul is None:
+                modul_vag = _pl.Path(__file__).parent / "04_chunka_och_embedda.py"
+                spec = _iutil.spec_from_file_location("chunka_embedda", modul_vag)
+                modul = _iutil.module_from_spec(spec)
+                spec.loader.exec_module(modul)
+                _chunka_modul = modul
     return _chunka_modul
 
 
@@ -166,25 +174,6 @@ def _retsinformation_get(endpoint: str, params: dict = None) -> dict:
     return resp.json()
 
 
-@contextlib.contextmanager
-def _tysta_subprocess_stdout():
-    """OS-nivå redirigering av FD 1 under bullriga C-bindningsanrop."""
-    log_vag = _LOG_DIR / "subprocess.log"
-    save_out = os.dup(1)
-    save_err = os.dup(2)
-    log_fd   = os.open(str(log_vag), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.dup2(log_fd, 1)
-        os.dup2(log_fd, 2)
-        yield
-    finally:
-        os.dup2(save_out, 1)
-        os.dup2(save_err, 2)
-        os.close(save_out)
-        os.close(save_err)
-        os.close(log_fd)
-
-
 def _hamta_pdf_bytes(url: str) -> Optional[bytes]:
     """
     Laddar ned en PDF från ft.dk med curl-cffi (kringgår Cloudflare managed challenge).
@@ -211,7 +200,7 @@ def _extrahera_pdf_text(pdf_bytes: bytes) -> Optional[str]:
             f.write(pdf_bytes)
             tmp_vag = f.name
         try:
-            with _tysta_subprocess_stdout():
+            with tysta_fd(_LOG_DIR / "subprocess.log"):
                 text = pymupdf4llm.to_markdown(tmp_vag)
             return text if text.strip() else None
         finally:
