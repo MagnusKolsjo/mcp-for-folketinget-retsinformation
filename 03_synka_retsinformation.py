@@ -28,6 +28,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -74,10 +75,13 @@ _XML_HEADERS = {
 }
 
 
-def _api_get_harvest(dato: str) -> list[dict]:
+def _api_get_harvest(dato: str) -> list[dict] | None:
     """
     GET /v1/Documents?date=YYYY-MM-DD mot Retsinformation harvest-API.
-    Returnerar lista med dokumentposter för det datumet.
+    Returnerar lista med dokumentposter för det datumet, eller None om
+    anropet misslyckades. En tom lista betyder att dygnet saknar ändringar;
+    None betyder att det inte går att veta, och då får checkpointen inte
+    flyttas.
     dato: ISO-datum som sträng, t.ex. '2026-05-14'
     """
     url = f"{API_BAS_URL}/Documents"
@@ -89,6 +93,9 @@ def _api_get_harvest(dato: str) -> list[dict]:
             if resp.status_code == 429:
                 vantetid = int(resp.headers.get("Retry-After", "30"))
                 logger.warning("Rate-limit (429) — väntar %d sek", vantetid)
+                if forsok == 2:
+                    logger.error("Harvest-anrop gav 429 tre gånger för dato=%s", dato)
+                    return None
                 time.sleep(vantetid)
                 continue
             if resp.status_code == 400:
@@ -101,10 +108,11 @@ def _api_get_harvest(dato: str) -> list[dict]:
         except Exception as e:
             if forsok == 2:
                 logger.error("Harvest-anrop misslyckades för dato=%s: %s", dato, e)
-                return []
+                return None
             logger.warning("Harvest-anrop försök %d/3 misslyckades: %s", forsok + 1, e)
-            time.sleep(2 ** forsok)
-    return []
+            # Källan tar emot ett anrop per tionde sekund
+            time.sleep(FORDROJ_HARVEST)
+    return None
 
 
 def _hamta_eli_xml(href: str) -> bytes | None:
@@ -295,20 +303,24 @@ def _normalisera_typ(short_name: str | None) -> tuple[str | None, str | None]:
 # Synk
 # ---------------------------------------------------------------------------
 
-def synka_dato(dato: str) -> tuple[int, int]:
+def synka_dato(dato: str) -> tuple[int, int, int]:
     """
     Hämtar och lagrar alla dokument som ändrades på ett givet datum.
-    Returnerar (granskade, sparade).
+    Returnerar (granskade, sparade, fel), där fel räknar harvest-anrop och
+    dokument som inte gick att hämta.
     """
     logger.info("  Hämtar harvest för dato=%s", dato)
     poster = _api_get_harvest(dato)
+    if poster is None:
+        return 0, 0, 1
     logger.info("  %d poster från harvest-API", len(poster))
 
     if not poster:
-        return 0, 0
+        return 0, 0, 0
 
     granskade = 0
     sparade   = 0
+    fel       = 0
 
     for post in poster:
         granskade += 1
@@ -347,6 +359,8 @@ def synka_dato(dato: str) -> tuple[int, int]:
         parsed = {}
         if xml_bytes:
             parsed = _parsa_eli_xml(xml_bytes)
+        else:
+            fel += 1
 
         titel      = parsed.get("titel") or ""
         fulltext   = parsed.get("fulltext_md")
@@ -390,10 +404,10 @@ def synka_dato(dato: str) -> tuple[int, int]:
 
         logger.debug("  [%s] %s — %s", typ, dok_id_ext, titel[:60])
 
-    return granskade, sparade
+    return granskade, sparade, fel
 
 
-def synka(antal_dagar: int = 1):
+def synka(antal_dagar: int = 1) -> bool:
     """
     Hämtar dokument för de senaste antal_dagar dagarna.
     Normalt: antal_dagar=1 (gårdag).
@@ -402,20 +416,30 @@ def synka(antal_dagar: int = 1):
     idag = datetime.now(timezone.utc).date()
     totalt_granskade = 0
     totalt_sparade   = 0
+    totalt_fel       = 0
 
     for dagar_bakåt in range(antal_dagar, 0, -1):
         dato = (idag - timedelta(days=dagar_bakåt)).isoformat()
-        g, s = synka_dato(dato)
+        g, s, f = synka_dato(dato)
         totalt_granskade += g
         totalt_sparade   += s
-        logger.info("  dato=%s: %d granskade, %d sparade", dato, g, s)
+        totalt_fel       += f
+        logger.info("  dato=%s: %d granskade, %d sparade, %d fel", dato, g, s, f)
 
         if dagar_bakåt > 1:
             time.sleep(FORDROJ_HARVEST)
 
-    nu = datetime.now(timezone.utc).isoformat()
-    db.spara_sync_status("retsinformation_senaste_synk", nu)
-    logger.info("Retsinformation-synk klar: %d granskade totalt, %d sparade", totalt_granskade, totalt_sparade)
+    # Checkpointen flyttas bara när allt gick igenom. Annars tar nästa körning
+    # om samma dygn (upserten är idempotent), så länge de ligger inom
+    # harvest-API:ets tio dagar.
+    if totalt_fel == 0:
+        nu = datetime.now(timezone.utc).isoformat()
+        db.spara_sync_status("retsinformation_senaste_synk", nu)
+    else:
+        logger.error("%d fel under synken — checkpointen flyttas inte", totalt_fel)
+    logger.info("Retsinformation-synk klar: %d granskade totalt, %d sparade, %d fel",
+                totalt_granskade, totalt_sparade, totalt_fel)
+    return totalt_fel == 0
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +454,14 @@ def main():
              f"Standard: 1 (gårdag) om senaste synk är känd, annars {MAX_HISTORIK_DAGAR}."
     )
     args = parser.parse_args()
+
+    # Retsinformation tar bara emot anrop 03:00–23:45 dansk tid. Utanför
+    # fönstret görs inga anrop, och checkpointen står kvar till nästa körning.
+    klocka = datetime.now(ZoneInfo("Europe/Copenhagen")).strftime("%H:%M")
+    if not ("03:00" <= klocka < "23:45"):
+        logger.warning("Klockan är %s dansk tid, utanför Retsinformations öppettid "
+                       "03:00–23:45. Inga anrop görs.", klocka)
+        return
 
     db.initialisera_schema()
 
@@ -449,8 +481,10 @@ def main():
             logger.info("Första körning — hämtar de senaste %d dagarna (API-max)", antal)
 
     logger.info("=== Retsinformation-synk startad (antal_dagar=%d) ===", antal)
-    synka(antal_dagar=antal)
+    lyckad = synka(antal_dagar=antal)
     logger.info("=== Retsinformation-synk avslutad ===")
+    if not lyckad:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

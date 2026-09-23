@@ -42,8 +42,11 @@ cd "$MAPP"
 # Steg 1: Retsinformation (harvest-API — tar hänsyn till missade dagar auto.)
 # ---------------------------------------------------------------------------
 echo "[$(date '+%H:%M:%S')] Steg 1: Retsinformation harvest" >> "$LOGG"
-"$PYTHON" "$MAPP/03_synka_retsinformation.py" >> "$LOGG" 2>&1
-echo "[$(date '+%H:%M:%S')] Steg 1 klar" >> "$LOGG"
+if "$PYTHON" "$MAPP/03_synka_retsinformation.py" >> "$LOGG" 2>&1; then
+    echo "[$(date '+%H:%M:%S')] Steg 1 klar" >> "$LOGG"
+else
+    echo "[$(date '+%H:%M:%S')] Steg 1 MISSLYCKADES — checkpointen flyttades inte" >> "$LOGG"
+fi
 
 # ---------------------------------------------------------------------------
 # Steg 2: Folketing ODA (inkrementell på opdateringsdato sedan förra lyckade körningen)

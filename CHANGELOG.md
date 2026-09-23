@@ -57,6 +57,14 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- `03_synka_retsinformation.py` flyttar checkpointen
+  (`retsinformation_senaste_synk`) bara när körningen gick igenom. Tidigare
+  räknades ett misslyckat harvest-anrop som ett dygn utan ändringar, och
+  dokument vars XML inte kunde hämtas gick förlorade. Vid fel avslutas
+  skriptet med exitkod 1 och nästa körning tar om samma dygn. Utanför
+  Retsinformations öppettid (03:00–23:45 dansk tid) görs inga anrop, och
+  omförsök efter nätverksfel väntar tio sekunder. `synk_daglig.sh`
+  fortsätter med övriga steg när steget misslyckas.
 - En uppdatering av ett ODA-ärende skriver inte längre över en redan
   extraherad PDF-text med ärendets resume (`db.upsert_dokument` har fått
   `behall_fulltext`).
