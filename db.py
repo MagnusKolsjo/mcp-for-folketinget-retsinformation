@@ -6,7 +6,7 @@ Schema: danmark
 
 DATABASE_URL MÅSTE vara satt — antingen i .env eller som miljövariabel.
 SQLite används bara om URL:en explicit börjar med "sqlite:///".
-Om DATABASE_URL saknas kastas ett ConfigurationError med instruktioner.
+Om DATABASE_URL saknas kastas Konfigurationsfel med instruktioner.
 
 Exempel i .env:
   postgresql://<ANVÄNDARE>@localhost:5432/riksdagstryck
@@ -31,11 +31,19 @@ except ImportError:
     pass  # python-dotenv valfritt — .env-stöd uteblir men allt annat fungerar
 
 
+class Konfigurationsfel(RuntimeError):
+    """DATABASE_URL eller schemafilerna saknas eller är felaktiga.
+
+    Ärver RuntimeError, så att befintliga anropare som fångar RuntimeError
+    fungerar som förut, men kan skiljas från andra körtidsfel.
+    """
+
+
 def _hamta_url() -> str:
-    """Hämtar och validerar DATABASE_URL. Kastar ConfigurationError om den saknas."""
+    """Hämtar och validerar DATABASE_URL. Kastar Konfigurationsfel om den saknas eller har fel format."""
     url = os.environ.get("DATABASE_URL", "")
     if not url:
-        raise RuntimeError(
+        raise Konfigurationsfel(
             "DATABASE_URL är inte satt.\n"
             "Skapa en .env-fil i samma mapp som db.py och lägg till:\n"
             "  DATABASE_URL=postgresql://anvandare@localhost:5432/riksdagstryck\n"
@@ -43,7 +51,7 @@ def _hamta_url() -> str:
             "Se config.example.env för fullständigt exempel."
         )
     if not (url.startswith("postgresql") or url.startswith("sqlite:///")):
-        raise RuntimeError(
+        raise Konfigurationsfel(
             f"Okänt DATABASE_URL-format: {url!r}\n"
             "Förväntade 'postgresql://...' eller 'sqlite:///...'."
         )
@@ -121,7 +129,7 @@ def _hamta_schema_ddl() -> str:
     try:
         return sokvag.read_text(encoding="utf-8")
     except FileNotFoundError:
-        raise RuntimeError(
+        raise Konfigurationsfel(
             f"Schemafilen saknas: {sokvag}\n"
             "Kontrollera att db/schema_postgres.sql och db/schema_sqlite.sql finns."
         )

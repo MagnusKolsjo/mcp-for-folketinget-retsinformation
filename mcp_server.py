@@ -381,8 +381,7 @@ def _som_toolerror(vad: str):
             f"Databasfel vid {vad}: {fel}. Kontrollera att databasen är igång "
             "och att DATABASE_URL i .env pekar rätt."
         ) from fel
-    except RuntimeError as fel:
-        # db._hamta_url() kastar RuntimeError när DATABASE_URL saknas eller är fel
+    except db.Konfigurationsfel as fel:
         logger.error("Konfigurationsfel vid %s: %s", vad, fel)
         raise ToolError(f"Konfigurationsfel vid {vad}: {fel}") from fel
 
@@ -506,6 +505,28 @@ def _hamta_chunka_modul():
                 spec.loader.exec_module(modul)
                 _chunka_modul = modul
     return _chunka_modul
+
+
+def _semantisk_modul():
+    """Returnerar chunkmodulen med embeddingmodellen inläst, eller kastar ToolError.
+
+    Modellinläsningen kan fallera på många sätt: modellen saknas i cachen och
+    Hugging Face går inte att nå (OSError), sentence-transformers eller torch
+    saknas (ImportError), eller torch fallerar vid inläsning (RuntimeError).
+    Oavsett orsak ska klienten få veta att det är modellen som saknas.
+    """
+    try:
+        modul = _hamta_chunka_modul()
+        modul._hamta_modell()
+    except Exception as fel:
+        logger.error("Embeddingmodellen kunde inte laddas: %s", fel, exc_info=True)
+        modellnamn = os.getenv("EMBEDDING_MODELL", "intfloat/multilingual-e5-base")
+        raise ToolError(
+            f"Embeddingmodellen {modellnamn} kunde inte laddas "
+            f"({type(fel).__name__}: {fel}). Semantisk sökning är inte tillgänglig; "
+            "använd dk_sok, dk_sok_folketing eller dk_sok_lovgivning."
+        ) from fel
+    return modul
 
 
 def _forvarm_embedding() -> None:
@@ -994,8 +1015,9 @@ def dk_sok_semantisk(
     if not db._ar_postgres():
         raise ToolError(_SQLITE_EJ_VEKTOR)
 
+    modul = _semantisk_modul()
     with _som_toolerror("den semantiska sökningen"):
-        resultat = _hamta_chunka_modul().semantisk_sok(sokterm, limit=max_traffar)
+        resultat = modul.semantisk_sok(sokterm, limit=max_traffar)
 
     if not resultat:
         raise ToolError(
@@ -1021,8 +1043,9 @@ def dk_sok_i_dokument(
     if not db._ar_postgres():
         raise ToolError(_SQLITE_EJ_VEKTOR)
 
+    modul = _semantisk_modul()
     with _som_toolerror(f"sökningen i dokument {dok_id}"):
-        resultat = _hamta_chunka_modul().semantisk_sok_i_dokument(dok_id, fraga, limit=max_treff)
+        resultat = modul.semantisk_sok_i_dokument(dok_id, fraga, limit=max_treff)
 
     # semantisk_sok_i_dokument signalerar okänt dokument och saknade chunks med ett fel-fält
     if "fel" in resultat:

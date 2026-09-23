@@ -44,6 +44,11 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- När embeddingmodellen inte kan laddas ger de semantiska verktygen ett
+  verktygsfel som namnger modellen och orsaken, i stället för ett allmänt fel.
+- Bara fel i `DATABASE_URL` och schemafilerna kallas konfigurationsfel
+  (`db.Konfigurationsfel`, en underklass till `RuntimeError`); andra körtidsfel
+  rapporteras inte längre som felaktig konfiguration.
 - `QUERY_EXPANSION_ENABLED` respekteras. Tidigare försökte `dk_sok` nå
   LLM-endpointen vid varje anrop även när flaggan var avstängd, vilket kostade
   runt 1,5 sekunder när ingen endpoint svarade. Utan expansion är fältet
