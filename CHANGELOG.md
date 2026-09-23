@@ -44,6 +44,9 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- En uppdatering av ett ODA-ärende skriver inte längre över en redan
+  extraherad PDF-text med ärendets resume (`db.upsert_dokument` har fått
+  `behall_fulltext`).
 - Buffrad utdata på stdout och stderr hamnar inte längre i loggfilerna för
   pymupdf och embeddingmodellen.
 - `dk_hamta_afstemning` och `dk_hamta_dokument` med `sagid` redovisar delar

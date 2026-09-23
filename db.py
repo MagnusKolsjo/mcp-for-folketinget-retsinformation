@@ -252,8 +252,15 @@ def upsert_dokument(
     baggrundsmateriale: Optional[str] = None,
     status: Optional[str] = None,
     giltig_till: Optional[str] = None,
+    behall_fulltext: bool = False,
 ) -> int:
-    """Infogar eller uppdaterar ett dokument. Returnerar dess id."""
+    """Infogar eller uppdaterar ett dokument. Returnerar dess id.
+
+    behall_fulltext=True låter en befintlig fulltext_md stå kvar och använder
+    det nya värdet bara när raden saknar text. ODA-synken behöver det: den
+    skickar resume som preliminär text, och utan flaggan skulle varje
+    uppdatering av ett ärende skriva över en redan extraherad PDF-text.
+    """
     p = _prefix()
     nu = _now()
     kolumner = (
@@ -269,6 +276,10 @@ def upsert_dokument(
         fulltext_md, status, giltig_till, nu
     )
     if _ar_postgres():
+        fulltext_uttryck = (
+            f"COALESCE({p}dokument.fulltext_md, EXCLUDED.fulltext_md)" if behall_fulltext
+            else f"COALESCE(EXCLUDED.fulltext_md, {p}dokument.fulltext_md)"
+        )
         platshallare = ", ".join(["%s"] * len(varden))
         with _cursor() as cur:
             cur.execute(
@@ -291,7 +302,7 @@ def upsert_dokument(
                         afgoerelse            = COALESCE(EXCLUDED.afgoerelse, {p}dokument.afgoerelse),
                         begrundelse           = COALESCE(EXCLUDED.begrundelse, {p}dokument.begrundelse),
                         baggrundsmateriale    = COALESCE(EXCLUDED.baggrundsmateriale, {p}dokument.baggrundsmateriale),
-                        fulltext_md           = COALESCE(EXCLUDED.fulltext_md, {p}dokument.fulltext_md),
+                        fulltext_md           = {fulltext_uttryck},
                         status                = COALESCE(EXCLUDED.status, {p}dokument.status),
                         giltig_till           = COALESCE(EXCLUDED.giltig_till, {p}dokument.giltig_till),
                         synkad                = EXCLUDED.synkad
@@ -300,6 +311,10 @@ def upsert_dokument(
             )
             return cur.fetchone()[0]
     else:
+        fulltext_uttryck = (
+            "COALESCE(dokument.fulltext_md, excluded.fulltext_md)" if behall_fulltext
+            else "COALESCE(excluded.fulltext_md, dokument.fulltext_md)"
+        )
         platshallare = ", ".join(["?"] * len(varden))
         with _cursor() as cur:
             cur.execute(
@@ -322,7 +337,7 @@ def upsert_dokument(
                         afgoerelse            = COALESCE(excluded.afgoerelse, dokument.afgoerelse),
                         begrundelse           = COALESCE(excluded.begrundelse, dokument.begrundelse),
                         baggrundsmateriale    = COALESCE(excluded.baggrundsmateriale, dokument.baggrundsmateriale),
-                        fulltext_md           = COALESCE(excluded.fulltext_md, dokument.fulltext_md),
+                        fulltext_md           = {fulltext_uttryck},
                         status                = COALESCE(excluded.status, dokument.status),
                         giltig_till           = COALESCE(excluded.giltig_till, dokument.giltig_till),
                         synkad                = excluded.synkad""",
