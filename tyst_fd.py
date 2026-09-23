@@ -36,16 +36,23 @@ _FD_LAS = threading.RLock()
 def tysta_fd(log_vag: Path | str):
     """Pekar om fd 1 och 2 till `log_vag` under blocket och återställer dem sedan."""
     with _FD_LAS:
-        spara_ut = os.dup(1)
-        spara_fel = os.dup(2)
-        log_fd = os.open(str(log_vag), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        # Varje deskriptor stängs bara om den faktiskt öppnades, så att ett
+        # fel i os.open eller os.dup inte läcker de deskriptorer som redan
+        # skapats. Att återställa fd 1 och 2 innan de pekats om är ofarligt.
+        spara_ut = spara_fel = log_fd = None
         try:
+            spara_ut = os.dup(1)
+            spara_fel = os.dup(2)
+            log_fd = os.open(str(log_vag), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
             os.dup2(log_fd, 1)
             os.dup2(log_fd, 2)
             yield
         finally:
-            os.dup2(spara_ut, 1)
-            os.dup2(spara_fel, 2)
-            os.close(spara_ut)
-            os.close(spara_fel)
-            os.close(log_fd)
+            if spara_ut is not None:
+                os.dup2(spara_ut, 1)
+                os.close(spara_ut)
+            if spara_fel is not None:
+                os.dup2(spara_fel, 2)
+                os.close(spara_fel)
+            if log_fd is not None:
+                os.close(log_fd)
