@@ -75,6 +75,8 @@ except ImportError:
 
 ODA_BAS_URL = "https://oda.ft.dk/api"
 
+# Termexpansion är ett uttryckligt val: utan flaggan görs inga LLM-anrop.
+QUERY_EXPANSION_ENABLED  = os.getenv("QUERY_EXPANSION_ENABLED", "false").strip().lower() in ("1", "true", "ja", "yes")
 QUERY_EXPANSION_BASE_URL = os.getenv("QUERY_EXPANSION_BASE_URL", "http://localhost:11434/v1")
 QUERY_EXPANSION_API_KEY  = os.getenv("QUERY_EXPANSION_API_KEY", "ollama")
 QUERY_EXPANSION_MODEL    = os.getenv("QUERY_EXPANSION_MODEL", "llama3")
@@ -616,10 +618,11 @@ def dk_sok(
     typ: Annotated[Optional[str], Field(description="Filtrera på dokumenttyp: 'lovforslag', 'lov', 'bekendtgorelse', 'betaenkning' m.fl.")] = None,
     periode: Annotated[Optional[str], Field(description="Filtrera på valperiod, t.ex. '20242' (2024-25)")] = None,
     max_traffar: Annotated[int, Field(description="Max antal resultat (standard 20)")] = 20,
-    expandera: Annotated[bool, Field(description="Expandera söktermen med juridisk terminologi (standard true)")] = True,
+    expandera: Annotated[bool, Field(description="Expandera söktermen med juridisk terminologi (standard true). Kräver att termexpansion är påslagen på servern (QUERY_EXPANSION_ENABLED); annars söks termen som den är och expansion blir null.")] = True,
 ) -> SokSvar:
     """Söker i alla danska källor (Folketing ODA + Retsinformation) via lokal databas. Accepterar kommaseparerade söktermer (OR-logik). Stöder termexpansion till dansk parlamentarisk och juridisk terminologi."""
-    expansion = _expandera_fraga(sokterm) if expandera else None
+    # expansion är None när ingen expansion gjordes (avstängd eller ej begärd)
+    expansion = _expandera_fraga(sokterm) if expandera and QUERY_EXPANSION_ENABLED else None
     effektiv_term = expansion if expansion is not None else sokterm
 
     termer = [t.strip() for t in effektiv_term.split(",") if t.strip()]

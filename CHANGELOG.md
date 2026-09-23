@@ -44,6 +44,10 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- `QUERY_EXPANSION_ENABLED` respekteras. Tidigare försökte `dk_sok` nå
+  LLM-endpointen vid varje anrop även när flaggan var avstängd, vilket kostade
+  runt 1,5 sekunder när ingen endpoint svarade. Utan expansion är fältet
+  `expansion` null.
 - `dk_sok_semantisk` sorterar träffarna efter avstånd. Tidigare gav den
   de dokument som hade lägst id, oavsett hur väl de matchade frågan.
 - Lat inläsning av embeddingmodellen och av chunkmodulen är trådsäker.
