@@ -406,21 +406,29 @@ def _oda_get(endpoint: str, params: Optional[dict] = None) -> dict:
     return resp.json()
 
 
-def _hamta_pdf_bytes(url: str) -> Optional[bytes]:
+class _FulltextFel(Exception):
+    """Orsaken till att en PDF inte gav någon text, formulerad för anroparen."""
+
+
+def _hamta_pdf_bytes(url: str) -> bytes:
     """
     Laddar ned en PDF från ft.dk med curl-cffi (kringgår Cloudflare managed challenge).
-    Returnerar PDF-bytes eller None vid fel.
+    Kastar _FulltextFel med orsaken när ingen PDF kom tillbaka.
     """
     if not _CURL_CFFI_TILLGANGLIG:
         logger.error("curl-cffi saknas — kan inte ladda ned ft.dk PDF: %s", url)
-        return None
+        raise _FulltextFel("curl-cffi är inte installerat på servern, så ft.dk:s PDF:er kan inte hämtas")
     try:
         resp = cf_requests.get(url, impersonate="chrome", timeout=60)
         resp.raise_for_status()
-        return resp.content
     except Exception as e:
         logger.error("PDF-nedladdning misslyckades: %s — %s", url, e)
-        return None
+        raise _FulltextFel(f"PDF:en kunde inte hämtas från ft.dk ({type(e).__name__}: {e})") from e
+    # Cloudflare svarar ibland 200 med en utmaningssida i stället för filen
+    if not resp.content.startswith(b"%PDF"):
+        logger.error("ft.dk svarade inte med en PDF: %s", url)
+        raise _FulltextFel("ft.dk svarade inte med en PDF, troligen på grund av botskydd")
+    return resp.content
 
 
 def _ar_ftdk_pdf(url: str) -> bool:
@@ -430,11 +438,18 @@ def _ar_ftdk_pdf(url: str) -> bool:
         and delar.path.lower().endswith(".pdf")
 
 
-def _extrahera_pdf_text(pdf_bytes: bytes) -> Optional[str]:
-    """Extraherar text från PDF-bytes med pymupdf4llm."""
+def _extrahera_pdf_text(pdf_bytes: bytes) -> str:
+    """Extraherar text från PDF-bytes med pymupdf4llm.
+
+    Kastar _FulltextFel med orsaken när ingen text kom ut.
+    """
     try:
         import tempfile
         import pymupdf4llm
+    except ImportError as e:
+        logger.warning("pymupdf4llm saknas — PDF-extraktion ej tillgänglig")
+        raise _FulltextFel("pymupdf4llm är inte installerat på servern, så PDF:en kan inte läsas") from e
+    try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_bytes)
             tmp_vag = f.name
@@ -443,15 +458,14 @@ def _extrahera_pdf_text(pdf_bytes: bytes) -> Optional[str]:
             # tål att köras från flera trådar samtidigt.
             with tysta_fd(_LOG_DIR / "subprocess.log"):
                 text = pymupdf4llm.to_markdown(tmp_vag)
-            return text if text.strip() else None
         finally:
             os.unlink(tmp_vag)
-    except ImportError:
-        logger.warning("pymupdf4llm saknas — PDF-extraktion ej tillgänglig")
-        return None
     except Exception as e:
         logger.error("PDF-extraktion misslyckades: %s", e)
-        return None
+        raise _FulltextFel(f"PDF:en kunde inte tolkas ({type(e).__name__}: {e})") from e
+    if not text.strip():
+        raise _FulltextFel("PDF:en innehåller ingen extraherbar text, troligen en inskannad bild")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -829,21 +843,24 @@ def dk_hamta_dokument(
             )
     elif not dok.get("fulltext_md"):
         logger.info("Hämtar PDF för dok %s: %s", dok.get("id"), dok.get("url"))
-        pdf_bytes = _hamta_pdf_bytes(dok["url"])
-        if pdf_bytes:
-            text = _extrahera_pdf_text(pdf_bytes)
-            if text:
-                dok["fulltext_md"] = text
-                try:
-                    with db._cursor() as cur:
-                        p = db._prefix()
-                        ph = "%s" if db._ar_postgres() else "?"
-                        cur.execute(
-                            f"UPDATE {p}dokument SET fulltext_md = {ph} WHERE id = {ph}",
-                            (text, dok["id"])
-                        )
-                except Exception as e:
-                    logger.warning("Kunde inte spara fulltext: %s", e)
+        try:
+            text = _extrahera_pdf_text(_hamta_pdf_bytes(dok["url"]))
+        except _FulltextFel as fel:
+            anmarkning = f"Fulltexten finns inte lokalt och kunde inte hämtas: {fel}. PDF: {dok['url']}"
+        else:
+            dok["fulltext_md"] = text
+            # Att cachningen misslyckas påverkar inte svaret; texten hämtas
+            # då igen vid nästa anrop.
+            try:
+                with db._cursor() as cur:
+                    p = db._prefix()
+                    ph = "%s" if db._ar_postgres() else "?"
+                    cur.execute(
+                        f"UPDATE {p}dokument SET fulltext_md = {ph} WHERE id = {ph}",
+                        (text, dok["id"])
+                    )
+            except Exception as e:
+                logger.warning("Kunde inte spara fulltext: %s", e)
 
     # giltig_till döljs; ikraftträdandedatum exponeras
     svar: Dokument = {

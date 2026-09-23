@@ -44,6 +44,9 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- När en ft.dk-PDF inte ger någon text säger `anmarkning` varför: botskydd,
+  nätverksfel, saknat paket (curl-cffi, pymupdf4llm), trasig PDF eller en
+  inskannad PDF utan text. Tidigare blev `fulltext_md` tyst null.
 - `dk_hamta_dokument` skickar bara Folketingets PDF:er på ft.dk till
   PDF-hämtningen. Retsinformation-dokument utan lokal fulltext (drygt 6 000,
   främst äldre och historiska) gick tidigare samma väg: servern hämtade
