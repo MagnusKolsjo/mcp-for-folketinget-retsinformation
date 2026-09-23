@@ -44,6 +44,8 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- Buffrad utdata på stdout och stderr hamnar inte längre i loggfilerna för
+  pymupdf och embeddingmodellen.
 - `dk_hamta_afstemning` och `dk_hamta_dokument` med `sagid` redovisar delar
   som inte gick att hämta från ODA (`ofullstandig: true` och `anmarkningar`)
   i stället för att tyst hoppa över dem. En votering vars röster per ledamot

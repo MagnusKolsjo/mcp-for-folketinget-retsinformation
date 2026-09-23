@@ -26,6 +26,7 @@ Ingångspunkt:
 
 import contextlib
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -40,6 +41,10 @@ def tysta_fd(log_vag: Path | str):
         # fel i os.open eller os.dup inte läcker de deskriptorer som redan
         # skapats. Att återställa fd 1 och 2 innan de pekats om är ofarligt.
         spara_ut = spara_fel = log_fd = None
+        # Pythons egna buffrar töms först; annars skrivs text som redan är
+        # på väg till stdout eller stderr ut i loggfilen när bufferten töms.
+        sys.stdout.flush()
+        sys.stderr.flush()
         try:
             spara_ut = os.dup(1)
             spara_fel = os.dup(2)
