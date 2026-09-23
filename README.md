@@ -2,7 +2,7 @@
 
 MCP-server för dansk parlamentarisk data och rättslig information — sök i Folketingets ärenden, voteringar och konsoliderad lagstiftning via Retsinformation.
 
-Sju verktyg med prefixet `dk_`:
+Nio verktyg med prefixet `dk_`:
 
 | Verktyg | Beskrivning |
 |---|---|
@@ -13,6 +13,12 @@ Sju verktyg med prefixet `dk_`:
 | `dk_lista_perioder` | Lista tillgängliga valperioder |
 | `dk_hamta_afstemning` | Voteringsresultat för ett ärende, inklusive per-ledamot-röstning |
 | `dk_sok_semantisk` | Semantisk sökning med pgvector (intfloat/multilingual-e5-base) |
+| `dk_sok_i_dokument` | Semantisk sökning inom ett enskilt cachat dokument |
+| `dk_hamta_aktor` | Ledamöter, partier, ministerier och utskott ur ODA:s Aktør-entitet |
+
+Alla verktyg returnerar strukturerade svar med utdataschema. Förväntade fel —
+okänt id, ODA som inte svarar, databas som är nere — ges som verktygsfel med
+ett meddelande som säger vad som gick fel.
 
 ## Datakällor
 
@@ -22,6 +28,7 @@ Sju verktyg med prefixet `dk_`:
 ## Krav
 
 - Python 3.10+
+- MCP Python SDK 2.x (`mcp>=2.0,<3`)
 - PostgreSQL med pgvector (för semantisk sökning och relationsspårning), eller SQLite (enklare installation utan vektorsökning)
 - Se `requirements.txt` för Python-beroenden
 
@@ -48,9 +55,13 @@ Daglig synk installeras med:
 python3 02_synka_oda.py --installera-schema
 ```
 
-## Konfiguration i Claude Desktop
+## Transport: stdio eller http
 
-Lägg till i `claude_desktop_config.json`:
+Transporten väljs med `MCP_TRANSPORT` i `.env`. Båda är likvärdiga val.
+
+### stdio (lokal MCP-klient)
+
+Lägg till i MCP-klientens konfigurationsfil:
 
 ```json
 "danmark": {
@@ -60,6 +71,21 @@ Lägg till i `claude_desktop_config.json`:
 }
 ```
 
+### http (Streamable HTTP)
+
+För delad drift bakom en reverse proxy. Servern lyssnar på
+`http://MCP_HOST:MCP_PORT/mcp` (standard `127.0.0.1:8714`).
+
+```bash
+MCP_TRANSPORT=http
+MCP_API_KEY=<LÅNG_SLUMPAD_NYCKEL>
+```
+
+`MCP_API_KEY` är obligatorisk i http-läget: utan den avbryts uppstarten med
+exitkod 2. Klienten skickar nyckeln som `Authorization: Bearer <nyckel>`;
+saknad header ger 401 och fel nyckel 403. Embeddingmodellen laddas vid
+uppstart i http-läget, så att första semantiska sökningen inte väntar på den.
+
 
 ## Svarsstorlek och trunkering
 
@@ -68,11 +94,15 @@ MCP-protokollet har en övre storleksgräns per svar. Det största danska dokume
 
 | Parameter | Innebörd |
 |---|---|
-| `max_tecken` | Teckentak för texten. Standard 60 000 tecken; `0` ger hela texten som ett uttryckligt val. |
+| `max_tecken` | Teckentak för texten. Standard 60 000 tecken, högst 400 000; `0` ger så mycket som ryms, alltså 400 000. |
 | `fran_tecken` | Börja vid denna teckenposition — för att läsa vidare där ett kapat svar slutade. |
 
 Ett kapat svar säger alltid ifrån med fälten `trunkerad`, `tecken_totalt`, `tecken_visade` och `fortsatt_fran_tecken`. Kapningen sker på ordgräns, aldrig mitt i
 ett ord.
+
+Svaret skickas både som JSON-text och som strukturerat innehåll, alltså två
+gånger. Taket på 400 000 tecken per svar håller det under protokollets gräns;
+längre texter läses i flera anrop.
 
 **Vid ordagranna citat:** citera aldrig ur ett svar som är markerat som kapat.
 Läs vidare med `fran_tecken` tills hela passagen är hämtad. Standardvärdet kan

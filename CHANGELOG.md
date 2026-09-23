@@ -6,6 +6,58 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ---
 
+## [Unreleased]
+
+### Ändrat
+
+- **Brytande: MCP Python SDK 2.x krävs** (`mcp>=2.0,<3`). Servern är
+  omskriven från lågnivå-`Server` med handskrivna scheman till `MCPServer`
+  med `@mcp.tool()`. Verktygsnamn, parametrar och beskrivningar är
+  oförändrade.
+- **Brytande: http-läget kör Streamable HTTP på `/mcp` och kräver
+  `MCP_API_KEY`.** Utan nyckel avbryts uppstarten med exitkod 2 i stället för
+  att servern startar oskyddad. Fel nyckel ger 403, saknad header 401.
+- **Brytande: förväntade fel är verktygsfel.** Okänt `dok_id`, `sagid` eller
+  `aktorid`, ODA som inte svarar, databasfel och semantisk sökning mot SQLite
+  ger nu `isError` med ett svenskt meddelande i stället för ett vanligt
+  textsvar. Klienter som tolkade feltexten som resultat behöver se över det.
+- **Brytande: `max_tecken` i `dk_hamta_dokument` har ett tak på 400 000
+  tecken**, och `0` betyder "så mycket som ryms" i stället för hela texten.
+  Svaret skickas nu både som JSON-text och som strukturerat innehåll, och
+  en hel lagtext på nära en miljon tecken skulle då spränga protokollets
+  gräns. Längre texter läses i flera anrop med `fran_tecken`.
+- Alla verktyg returnerar typade, strukturerade svar med utdataschema.
+  Textsvaret är samma JSON som förut. `dk_lista_perioder` ger en lista, som
+  skickas som ett textblock per period och strukturerat som `{"result": [...]}`;
+  `dk_hamta_dokument` och `dk_hamta_aktor`, som har två svarsformer, har
+  sitt strukturerade svar under `result`.
+- Verktygen körs på arbetstrådar i stället för att blockera servern, så att
+  flera anrop kan pågå samtidigt.
+- `requirements.txt` har versionsgränser.
+
+### Tillagt
+
+- Titel och annotationer (`readOnlyHint`, `openWorldHint` m.fl.) på alla
+  verktyg, cachningshintar för verktygslistan och serverinstruktioner som
+  beskriver verktygskedjorna.
+- I http-läget laddas embeddingmodellen vid uppstart.
+
+### Rättat
+
+- Lat inläsning av embeddingmodellen och av chunkmodulen är trådsäker.
+- Omdirigeringen av fd 1 och 2 under pymupdf- och embeddinganrop är
+  serialiserad, så att samtidiga anrop inte lämnar stdout och stderr pekande
+  på en loggfil. Det serialiserar också pymupdf, som inte tål flera trådar.
+- Typfiltret i `dk_sok`, `dk_sok_folketing` och `dk_sok_lovgivning` kraschar
+  inte längre på dokument utan typ.
+- Ingen FutureWarning från sentence-transformers 6 vid modellinläsning.
+
+### Borttaget
+
+- SSE-transporten (`/sse`, `/messages/`).
+
+---
+
 ## [1.2.0] — 2026-08-10
 
 ### Tillagt
