@@ -37,6 +37,19 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Tillagt
 
+- **Inkrementell ODA-synk på `opdateringsdato`.** `02_synka_oda.py --fas 1`
+  hämtar ärenden som ändrats sedan förra lyckade körningen, inte bara ärenden
+  med högre id än förut. Ändrade ärenden (ny status, resume, afgørelse)
+  uppdateras därmed i databasen. Pagineringen sker på nyckel
+  (`opdateringsdato`, `id`) i stället för `$skip`, så att ett ärende som
+  uppdateras under körningen inte förskjuter sidorna. Checkpointen
+  (`oda_senaste_opdateringsdato`) flyttas bara fram när körningen lyckats;
+  vid fel avslutas skriptet med exitkod 1. `--full` hämtar alla ärenden,
+  `--sedan YYYY-MM-DD` ärenden ändrade sedan ett datum. Den första körningen
+  utan checkpoint är en full synk (cirka 100 000 ärenden, ungefär 1 000
+  anrop). Den tidigare nyckeln `oda_senaste_sagid` används inte längre.
+- `synk_daglig.sh` fortsätter med fulltext och embedding när ODA-steget
+  misslyckas, och loggar att checkpointen inte flyttades.
 - Titel och annotationer (`readOnlyHint`, `openWorldHint` m.fl.) på alla
   verktyg, cachningshintar för verktygslistan och serverinstruktioner som
   beskriver verktygskedjorna.

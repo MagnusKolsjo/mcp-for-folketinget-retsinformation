@@ -7,8 +7,14 @@ Fas 2: Laddar hem och extraherar fulltext-PDF för lovforslag (typeid=3)
 
 Kör manuellt vid initial laddning (tar ett tag). Daglig delta-synk via launchd.
 
+Fas 1 är inkrementell: den hämtar sager vars opdateringsdato ligger efter
+förra lyckade körningen (checkpoint i sync_status), alltså både nya och
+ändrade ärenden. Utan checkpoint, eller med --full, hämtas alla sager.
+
 Användning:
   python3 02_synka_oda.py              # Kör fas 1 + 2
+  python3 02_synka_oda.py --full       # Fas 1 hämtar alla sager
+  python3 02_synka_oda.py --sedan 2026-09-22 --fas 1   # Sager ändrade sedan ett datum
   python3 02_synka_oda.py --fas 1      # Bara metadata
   python3 02_synka_oda.py --fas 2      # Bara fulltext (förutsätter fas 1 klar)
   python3 02_synka_oda.py --installera-schema  # Installerar launchd-jobb
@@ -165,112 +171,154 @@ def _extrahera_text(pdf_bytes: bytes) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Fas 1 — Metadata för alla sager
+# Fas 1 — Metadata för sager
 # ---------------------------------------------------------------------------
 
-def synka_sager_metadata():
-    """
-    Hämtar metadata för alla sager i ODA och lagrar i DB.
-    Delta-synk: hämtar sager med id > senaste kända id.
-    """
-    senaste_id = int(db.hamta_sync_status("oda_senaste_sagid") or "0")
-    logger.info("Fas 1: Hämtar sager med id > %d", senaste_id)
+# Synkstatusnyckel för den senaste opdateringsdato som en lyckad körning såg.
+# Värdet är ODA:s egen tidsstämpel (dansk lokaltid utan zon), oförändrad, så
+# att den kan skickas tillbaka i ett datetime-filter utan omräkning.
+CHECKPOINT_NYCKEL = "oda_senaste_opdateringsdato"
 
-    totalt_nya  = 0
-    hogsta_id   = senaste_id
-    skip        = 0
+_SAG_FALT = (
+    "id,typeid,statusid,periodeid,titel,titelkort,opdateringsdato,nummer,"
+    "nummerprefix,nummernumerisk,nummerpostfix,resume,afstemningskonklusion,"
+    "lovnummer,retsinformationsurl,paragrafnummer,paragraf,afgørelse,"
+    "begrundelse,baggrundsmateriale"
+)
 
-    # ODA stöder inte filter på id direkt i alla fall — vi paginerar från senaste id
-    filtrering = f"id gt {senaste_id}" if senaste_id > 0 else None
+
+def _spara_sag(sag: dict) -> None:
+    """Upsertar en sag i dokumenttabellen."""
+    sagid     = sag.get("id")
+    typeid    = sag.get("typeid")
+    periodeid = sag.get("periodeid")
+    # Ärendets bästa tillgängliga datum (afgørelsesdato → lovnummerdato →
+    # rådsmødedato → opdateringsdato), inte bara senast uppdaterad i ODA.
+    dato = oda_lib.basta_datum(sag)
+    # Beteckning: t.ex. "L 183" — bygg från prefix + nummer
+    nummer_prefix  = (sag.get("nummerprefix") or "").strip()
+    nummer_num     = (sag.get("nummernumerisk") or "").strip()
+    nummer_postfix = (sag.get("nummerpostfix") or "").strip()
+    if nummer_prefix and nummer_num:
+        beteckning = f"{nummer_prefix} {nummer_num}{nummer_postfix}".strip()
+    else:
+        beteckning = sag.get("nummer") or None
+
+    resume_text = sag.get("resume") or None
+    db.upsert_dokument(
+        kalla                 = "oda",
+        extern_id             = str(sagid),
+        beteckning            = beteckning,
+        typ                   = _typeid_till_navn(typeid),
+        titel                 = sag.get("titel") or "",
+        titelkort             = sag.get("titelkort") or None,
+        periode               = str(periodeid) if periodeid else None,
+        datum                 = dato,
+        url                   = None,           # PDF-URL sätts i fas 2
+        retsinformationsurl   = sag.get("retsinformationsurl") or None,
+        lovnummer             = sag.get("lovnummer") or None,
+        resume                = resume_text,
+        afstemningskonklusion = sag.get("afstemningskonklusion") or None,
+        paragrafnummer        = str(sag.get("paragrafnummer") or "").strip() or None,
+        paragraf              = sag.get("paragraf") or None,
+        afgoerelse            = sag.get("afgørelse") or None,
+        begrundelse           = sag.get("begrundelse") or None,
+        baggrundsmateriale    = sag.get("baggrundsmateriale") or None,
+        # resume är preliminär sökbar text för nya sager. En redan hämtad
+        # fulltext (PDF) får inte skrivas över när ett ärende uppdateras.
+        fulltext_md           = resume_text,
+        behall_fulltext       = True,
+    )
+
+
+def synka_sager_metadata(full: bool = False, sedan: str | None = None) -> bool:
+    """
+    Hämtar sager från ODA och lagrar dem i databasen. Returnerar True om
+    körningen gick igenom utan fel.
+
+    Inkrementellt (standard): sager med opdateringsdato efter checkpointen,
+    alltså både nya och ändrade ärenden. Utan checkpoint görs en full synk.
+    full=True: alla sager, oavsett checkpoint.
+    sedan: starttidpunkt ('YYYY-MM-DD' eller ODA-tidsstämpel) i stället för
+    checkpointen.
+
+    Pagineringen sker på nyckel (opdateringsdato, id) respektive id, inte med
+    $skip. Med $skip förskjuts sidorna när ett ärende uppdateras under
+    körningen, och ett ärende kan då hoppas över utan att det märks.
+
+    Checkpointen sätts till den största opdateringsdato som körningen såg och
+    flyttas bara fram när hela körningen lyckats. Nästa körning börjar på
+    samma tidsstämpel (inklusive), så ett ärende med exakt den tidsstämpeln
+    hämtas hellre två gånger än ingen. Upserten är idempotent.
+    """
+    befintlig = db.hamta_sync_status(CHECKPOINT_NYCKEL)
+    fran = sedan or (None if full else befintlig)
+    inkrementell = fran is not None
+    if inkrementell:
+        logger.info("Fas 1: inkrementell synk av sager med opdateringsdato >= %s", fran)
+    else:
+        logger.info("Fas 1: full synk av alla sager%s",
+                    "" if full else " (ingen checkpoint finns ännu)")
+
+    antal = 0
+    senaste_tid = fran
+    senaste_id = 0
+    hogsta_opdatering: str | None = None
 
     while True:
-        params = {
-            "$top":     str(SIDSTORLEK),
-            "$skip":    str(skip),
-            "$orderby": "id asc",
-            "$select":  "id,typeid,statusid,periodeid,titel,titelkort,opdateringsdato,nummerprefix,nummernumerisk,nummerpostfix,resume,afstemningskonklusion,lovnummer,retsinformationsurl,paragrafnummer,paragraf,afgørelse,begrundelse,baggrundsmateriale",
-        }
-        if filtrering:
-            params["$filter"] = filtrering
+        params = {"$top": str(SIDSTORLEK), "$select": _SAG_FALT}
+        if inkrementell:
+            params["$orderby"] = "opdateringsdato asc,id asc"
+            params["$filter"] = (
+                f"opdateringsdato gt datetime'{senaste_tid}' or "
+                f"(opdateringsdato eq datetime'{senaste_tid}' and id gt {senaste_id})"
+            )
+        else:
+            params["$orderby"] = "id asc"
+            params["$filter"] = f"id gt {senaste_id}"
 
         try:
             data = _oda_get("Sag", params)
         except Exception as e:
-            logger.error("ODA Sag-hämtning misslyckades vid skip=%d: %s", skip, e)
-            break
+            logger.error("ODA Sag-hämtning misslyckades efter %d sager: %s. "
+                         "Checkpointen flyttas inte.", antal, e)
+            return False
 
         poster = data.get("value", [])
-        if not poster:
-            break
-
         for sag in poster:
-            sagid    = sag.get("id")
-            typeid   = sag.get("typeid")
-            periodeid = sag.get("periodeid")
-            titel    = sag.get("titel", "")
-            # Använd ärendets bästa tillgängliga datum (afgørelsesdato →
-            # lovnummerdato → rådsmødedato → opdateringsdato). Tidigare användes
-            # bara opdateringsdato (senast-synkad i ODA) vilket gav missvisande
-            # synktid istället för ärendets verkliga datum för historiska sager.
-            dato     = oda_lib.basta_datum(sag)
-            # Beteckning: t.ex. "L 183" — bygg från prefix + nummer
-            nummer_prefix  = sag.get("nummerprefix", "").strip()
-            nummer_num     = sag.get("nummernumerisk", "").strip()
-            nummer_postfix = sag.get("nummerpostfix", "").strip()
-            if nummer_prefix and nummer_num:
-                beteckning = f"{nummer_prefix} {nummer_num}{nummer_postfix}".strip()
-            else:
-                beteckning = sag.get("nummer") or None
+            _spara_sag(sag)
+            antal += 1
+            opd = sag.get("opdateringsdato")
+            if opd and (hogsta_opdatering is None or opd > hogsta_opdatering):
+                hogsta_opdatering = opd
 
-            resume_text     = sag.get("resume") or None
-            afstemning_text = sag.get("afstemningskonklusion") or None
-            lovnummer_text  = sag.get("lovnummer") or None
-            rin_url         = sag.get("retsinformationsurl") or None
-            titelkort       = sag.get("titelkort") or None
-            paragrafnummer  = str(sag.get("paragrafnummer") or "").strip() or None
-            paragraf_text   = sag.get("paragraf") or None
-            afgoerelse_text = sag.get("afgørelse") or None
-            begrundelse_text = sag.get("begrundelse") or None
-            baggrund_text   = sag.get("baggrundsmateriale") or None
-
-            db.upsert_dokument(
-                kalla                 = "oda",
-                extern_id             = str(sagid),
-                beteckning            = beteckning,
-                typ                   = _typeid_till_navn(typeid),
-                titel                 = titel,
-                titelkort             = titelkort,
-                periode               = str(periodeid) if periodeid else None,
-                datum                 = dato,
-                url                   = None,           # PDF-URL sätts i fas 2
-                retsinformationsurl   = rin_url,
-                lovnummer             = lovnummer_text,
-                resume                = resume_text,
-                afstemningskonklusion = afstemning_text,
-                paragrafnummer        = paragrafnummer,
-                paragraf              = paragraf_text,
-                afgoerelse            = afgoerelse_text,
-                begrundelse           = begrundelse_text,
-                baggrundsmateriale    = baggrund_text,
-                fulltext_md           = resume_text,    # resume som initialt sökbart fält
-            )
-
-            if sagid > hogsta_id:
-                hogsta_id = sagid
-            totalt_nya += 1
-
-        logger.info("  Hämtat %d sager (skip=%d, högsta id=%d)", len(poster), skip, hogsta_id)
-        skip += SIDSTORLEK
-        time.sleep(FORDROJ_ODA)
-
+        if poster:
+            sista = poster[-1]
+            senaste_id = sista.get("id")
+            if inkrementell:
+                senaste_tid = sista.get("opdateringsdato")
+            logger.info("  Hämtat %d sager (totalt %d, senast id=%s, opdateringsdato=%s)",
+                        len(poster), antal, senaste_id, sista.get("opdateringsdato"))
         if len(poster) < SIDSTORLEK:
             break
+        time.sleep(FORDROJ_ODA)
 
-    if hogsta_id > senaste_id:
-        db.spara_sync_status("oda_senaste_sagid", str(hogsta_id))
-
-    logger.info("Fas 1 klar: %d nya/uppdaterade sager. Högsta sagid: %d", totalt_nya, hogsta_id)
-    return totalt_nya
+    # ODA:s tidsstämplar börjar alltid med YYYY-MM-DDTHH:MM:SS, så
+    # strängjämförelse ger samma ordning som tidsjämförelse.
+    #
+    # Med --sedan flyttas checkpointen bara om intervallet ansluter till den
+    # befintliga; annars skulle ärenden mellan checkpointen och --sedan aldrig
+    # hämtas. Checkpointen flyttas aldrig bakåt.
+    tacker_gapet = sedan is None or (befintlig is not None and sedan <= befintlig)
+    ny = max(x for x in (befintlig, hogsta_opdatering, fran if inkrementell else None) if x) \
+        if (befintlig or hogsta_opdatering) else None
+    if tacker_gapet and ny and ny != befintlig:
+        db.spara_sync_status(CHECKPOINT_NYCKEL, ny)
+    elif not tacker_gapet:
+        logger.info("  --sedan ansluter inte till checkpointen (%s); den lämnas orörd", befintlig)
+    logger.info("Fas 1 klar: %d nya eller ändrade sager. Checkpoint: %s",
+                antal, ny if tacker_gapet else befintlig)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -515,9 +563,15 @@ def main():
     parser = argparse.ArgumentParser(description="Synkskript för Folketing ODA")
     parser.add_argument("--fas", type=int, choices=[1, 2],
                         help="Kör bara fas 1 (metadata) eller fas 2 (fulltext)")
+    parser.add_argument("--full", action="store_true",
+                        help="Fas 1 hämtar alla sager i stället för bara de som ändrats sedan förra lyckade körningen")
+    parser.add_argument("--sedan", metavar="DATUM",
+                        help="Fas 1 hämtar sager ändrade från DATUM (YYYY-MM-DD) i stället för från checkpointen")
     parser.add_argument("--installera-schema", action="store_true",
                         help="Installerar launchd-jobb för daglig synk")
     args = parser.parse_args()
+    if args.full and args.sedan:
+        parser.error("--full och --sedan kan inte kombineras")
 
     if args.installera_schema:
         installera_launchd()
@@ -526,13 +580,17 @@ def main():
     logger.info("=== ODA-synk startad ===")
     db.initialisera_schema()
 
+    lyckad = True
     if args.fas is None or args.fas == 1:
-        synka_sager_metadata()
+        sedan = f"{args.sedan}T00:00:00" if args.sedan and len(args.sedan) == 10 else args.sedan
+        lyckad = synka_sager_metadata(full=args.full, sedan=sedan)
 
     if args.fas is None or args.fas == 2:
         synka_fulltext()
 
     logger.info("=== ODA-synk avslutad ===")
+    if not lyckad:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

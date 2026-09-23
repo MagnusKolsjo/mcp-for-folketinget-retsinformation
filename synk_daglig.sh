@@ -4,7 +4,7 @@
 # Körordning:
 #   1. Retsinformation harvest (delta, 5–30 min beroende på antal missade dagar)
 #      Skriptfil: 03_synka_retsinformation.py  (prefix 03, inte 01 — 01 finns ej)
-#   2. Folketing ODA (fas 1 + fas 2, inkrementell via checkpoint)
+#   2. Folketing ODA (fas 1 inkrementell på opdateringsdato, fas 2 fulltext)
 #      Skriptfil: 02_synka_oda.py
 #   3. Chunkning + embedding för nya/uppdaterade dokument
 #      Skriptfil: 04_chunka_och_embedda.py
@@ -46,11 +46,16 @@ echo "[$(date '+%H:%M:%S')] Steg 1: Retsinformation harvest" >> "$LOGG"
 echo "[$(date '+%H:%M:%S')] Steg 1 klar" >> "$LOGG"
 
 # ---------------------------------------------------------------------------
-# Steg 2: Folketing ODA (inkrementell — hoppar vid checkpoint)
+# Steg 2: Folketing ODA (inkrementell på opdateringsdato sedan förra lyckade körningen)
 # ---------------------------------------------------------------------------
 echo "[$(date '+%H:%M:%S')] Steg 2: ODA fas 1 (metadata)" >> "$LOGG"
-"$PYTHON" "$MAPP/02_synka_oda.py" --fas 1 >> "$LOGG" 2>&1
-echo "[$(date '+%H:%M:%S')] Steg 2a klar" >> "$LOGG"
+# Ett misslyckat steg lämnar checkpointen orörd och tas igen nästa dag; det
+# ska inte stoppa fulltext och embedding för det som redan hämtats.
+if "$PYTHON" "$MAPP/02_synka_oda.py" --fas 1 >> "$LOGG" 2>&1; then
+    echo "[$(date '+%H:%M:%S')] Steg 2a klar" >> "$LOGG"
+else
+    echo "[$(date '+%H:%M:%S')] Steg 2a MISSLYCKADES — checkpointen flyttades inte" >> "$LOGG"
+fi
 
 echo "[$(date '+%H:%M:%S')] Steg 2b: ODA fas 2 (fulltext PDF)" >> "$LOGG"
 "$PYTHON" "$MAPP/02_synka_oda.py" --fas 2 >> "$LOGG" 2>&1

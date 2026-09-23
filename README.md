@@ -49,6 +49,13 @@ python3 05_synka_retsinformation_sitemap.py --bara-lta --trad 2   # Historisk ha
 python3 04_chunka_och_embedda.py  # Chunkning och embedding
 ```
 
+Efter den första körningen är `02_synka_oda.py --fas 1` inkrementell: den
+hämtar ärenden vars `opdateringsdato` i ODA ligger efter förra lyckade
+körningen, alltså både nya och ändrade ärenden. Checkpointen ligger i
+`sync_status` (`oda_senaste_opdateringsdato`) och flyttas bara fram när hela
+körningen lyckats. `--full` hämtar alla ärenden på nytt, och
+`--sedan YYYY-MM-DD` hämtar ärenden ändrade sedan ett visst datum.
+
 Daglig synk installeras med:
 
 ```bash
