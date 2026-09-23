@@ -248,6 +248,8 @@ class Sag(TypedDict):
     begrundelse: str | None
     baggrundsmateriale: str | None
     dokument: list[SagDokument]
+    ofullstandig: NotRequired[bool]
+    anmarkningar: NotRequired[list[str]]
 
 
 class Periode(TypedDict):
@@ -283,6 +285,8 @@ class AfstemningSvar(TypedDict):
     sagid: int
     antal_afstemninger: int
     afstemninger: list[Afstemning]
+    ofullstandig: NotRequired[bool]
+    anmarkningar: NotRequired[list[str]]
 
 
 class SemantiskTraff(TypedDict):
@@ -946,30 +950,52 @@ def _hamta_sag_fran_oda(sagid: int) -> Sag:
         # (lovforslag, betænkninger, ændringsforslag, slutligt antagen lov).
         sd_data = _oda_get("SagDokument", {"$filter": f"sagid eq {sagid}", "$top": "50"})
 
+    # Delar som inte gick att hämta redovisas, så att ett ofullständigt
+    # ärende inte ser komplett ut.
+    anmarkningar: list[str] = []
+    kopplingar = sd_data.get("value", [])
+    if len(kopplingar) >= 50:
+        anmarkningar.append(
+            "Ärendet har minst 50 kopplade dokument; bara de 50 första visas."
+        )
+
     dokument_lista: list[SagDokument] = []
-    for sd in sd_data.get("value", []):
+    for sd in kopplingar:
         dok_id_oda = sd.get("dokumentid")
         if not dok_id_oda:
             continue
         try:
             dok_data = _oda_get(f"Dokument({dok_id_oda})")
             dok = dok_data.get("value", dok_data)
+        except Exception as e:
+            logger.warning("Kunde inte hämta dokument %s: %s", dok_id_oda, e)
+            anmarkningar.append(
+                f"Dokument {dok_id_oda} kunde inte hämtas från ODA "
+                f"({type(e).__name__}) och saknas i listan."
+            )
+            continue
+        fil_url = None
+        try:
             fil_data = _oda_get("Fil", {"$filter": f"dokumentid eq {dok_id_oda}", "$top": "1"})
             filer = fil_data.get("value", [])
             fil_url = filer[0].get("filurl") if filer else None
-            dokument_lista.append({
-                "dokumentid": dok_id_oda,
-                "titel":      dok.get("titel"),
-                # typeid skiljer lovforslag, betænkning, ændringsforslag,
-                # lovvedtagelse osv. — nödvändigt för att tråda processen rätt.
-                "typeid":     dok.get("typeid"),
-                "dato":       dok.get("dato"),
-                "fil_url":    fil_url,
-            })
         except Exception as e:
-            logger.warning("Kunde inte hämta dokument %s: %s", dok_id_oda, e)
+            logger.warning("Kunde inte hämta fil för dokument %s: %s", dok_id_oda, e)
+            anmarkningar.append(
+                f"Fil-uppgiften för dokument {dok_id_oda} kunde inte hämtas "
+                f"({type(e).__name__}); fil_url är null av det skälet, inte för att filen saknas."
+            )
+        dokument_lista.append({
+            "dokumentid": dok_id_oda,
+            "titel":      dok.get("titel"),
+            # typeid skiljer lovforslag, betænkning, ændringsforslag,
+            # lovvedtagelse osv. — nödvändigt för att tråda processen rätt.
+            "typeid":     dok.get("typeid"),
+            "dato":       dok.get("dato"),
+            "fil_url":    fil_url,
+        })
 
-    return {
+    svar: Sag = {
         "sagid": sagid,
         "beteckning": sag.get("nummer"),
         "titel": sag.get("titel"),
@@ -988,6 +1014,10 @@ def _hamta_sag_fran_oda(sagid: int) -> Sag:
         "baggrundsmateriale": sag.get("baggrundsmateriale") or None,
         "dokument": dokument_lista,
     }
+    if anmarkningar:
+        svar["ofullstandig"] = True
+        svar["anmarkningar"] = anmarkningar
+    return svar
 
 
 @mcp.tool(title="Lista Folketingets valperioder", annotations=LASNING_EXTERN)
@@ -1023,12 +1053,17 @@ def dk_hamta_afstemning(
         )
 
     afstemningar: list[Afstemning] = []
+    anmarkningar: list[str] = []
     for strin in sagstrin_lista:
         strinid = strin.get("id")
         try:
             af_data = _oda_get("Afstemning", {"$filter": f"sagstrinid eq {strinid}"})
         except Exception as e:
             logger.warning("Afstemning-hämtning misslyckades (sagstrinid=%s): %s", strinid, e)
+            anmarkningar.append(
+                f"Voteringarna för sagstrin {strinid} kunde inte hämtas ({type(e).__name__}); "
+                "listan kan sakna voteringar."
+            )
             continue
         for af in af_data.get("value", []):
             afstemningid = af.get("id")
@@ -1055,15 +1090,24 @@ def dk_hamta_afstemning(
                         for s in stemme_data.get("value", [])
                     ]
                 except Exception as e:
+                    # stemmer utelämnas hellre än att visas som en tom lista,
+                    # som skulle se ut som en votering utan röster.
                     logger.warning("Stemme-hämtning misslyckades (afstemningid=%s): %s", afstemningid, e)
-                    post["stemmer"] = []
+                    anmarkningar.append(
+                        f"Röster per ledamot för votering {afstemningid} kunde inte hämtas "
+                        f"({type(e).__name__}); stemmer saknas för den voteringen."
+                    )
             afstemningar.append(post)
 
-    return {
+    svar: AfstemningSvar = {
         "sagid": sagid,
         "antal_afstemninger": len(afstemningar),
         "afstemninger": afstemningar,
     }
+    if anmarkningar:
+        svar["ofullstandig"] = True
+        svar["anmarkningar"] = anmarkningar
+    return svar
 
 
 @mcp.tool(title="Semantisk sökning i dansk korpus", annotations=LASNING_DB)

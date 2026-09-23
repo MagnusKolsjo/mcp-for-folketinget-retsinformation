@@ -44,6 +44,13 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- `dk_hamta_afstemning` och `dk_hamta_dokument` med `sagid` redovisar delar
+  som inte gick att hämta från ODA (`ofullstandig: true` och `anmarkningar`)
+  i stället för att tyst hoppa över dem. En votering vars röster per ledamot
+  inte kunde hämtas saknar `stemmer` i stället för att visa en tom lista, och
+  ett dokument vars fil-uppgift inte gick att hämta finns kvar i listan.
+  Ärenden med minst 50 kopplade dokument får en anmärkning om att listan är
+  kapad.
 - `dk_hamta_dokument` visar när ändringslagarna inte gick att kontrollera
   (`andringar_kontrollerade: false` och en varning i `advarsel_andringar`).
   Tidigare svaldes felet, och en inaktuell lagtext såg gällande ut.
