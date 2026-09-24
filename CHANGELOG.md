@@ -37,6 +37,9 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Tillagt
 
+- `08_konvertera_vektorer.py` byter en befintlig databas till halfvec och
+  bygger HNSW-indexet. `--torrkorning` visar uppskattad tid, diskbehov, minne
+  och slutstorlek utan att ändra något; `--bara-index` bygger om indexet.
 - **Embeddings som `halfvec(768)` med HNSW-index.** `danmark.embeddings` saknade
   vektorindex, så varje semantisk sökning läste alla vektorer ur TOAST
   (drygt 20 s i driften). halfvec tar 1 540 byte per vektor i stället för
