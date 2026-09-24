@@ -86,15 +86,30 @@ ryms i `maintenance_work_mem`: räkna med knappt 2 kB per vektor.
 
 ## Uppgradering av en befintlig installation (från 1.2.0)
 
-Ordningen spelar roll; stegen 2–4 ändrar databasen och kan ta tid.
+Ordningen spelar roll; stegen 2–5 ändrar databasen och kan ta tid.
 
 1. Installera den nya koden och `requirements.txt` (mcp 2.x) och starta servern
-   en gång. Uppstarten lägger till kolumnen `fulltext_kalla` och markerar
-   ODA-ärenden vars fulltext bara är resume. Lagrar databasen embeddings som
-   `vector` loggas att `08_konvertera_vektorer.py` behövs; servern fungerar ändå.
-2. Byt vektorlagringen: `python3 08_konvertera_vektorer.py --torrkorning`,
+   en gång. Uppstarten gör bara snabba schemaändringar (kolumnerna
+   `fulltext_kalla` och `chunk_hash`) och tar några sekunder. Lagrar databasen
+   embeddings som `vector` loggas att `08_konvertera_vektorer.py` behövs; servern
+   fungerar ändå.
+2. Kör engångsuppdateringarna av befintliga rader:
+
+   ```bash
+   python3 db.py --migrera
+   ```
+
+   De markerar ODA-ärenden vars fulltext bara är resume och ger redan chunkade
+   dokument sin `chunk_hash`, och tar ungefär en minut på en databas med
+   150 000 dokument. De ligger utanför serverns uppstart eftersom
+   MCP-klienter bara väntar en begränsad tid på att servern svarar. Steget körs också
+   automatiskt i början av `02_synka_oda.py` och `04_chunka_och_embedda.py`,
+   och varje del bara en gång. Innan det körts fungerar allt som före
+   uppgraderingen: fas 2 hämtar inte PDF för ärenden med bara resume, och
+   dokument med chunks antas vara aktuella.
+3. Byt vektorlagringen: `python3 08_konvertera_vektorer.py --torrkorning`,
    därefter `python3 08_konvertera_vektorer.py --minne 2GB`.
-3. Kör ODA-synken. Den första körningen saknar checkpoint för `opdateringsdato`
+4. Kör ODA-synken. Den första körningen saknar checkpoint för `opdateringsdato`
    och hämtar därför alla ärenden (cirka 100 000, ungefär 1 000 anrop mot ODA).
    Fas 2 hämtar sedan PDF för alla lovforslag och beslutningsforslag som bara
    har resume, vilket kan bli många anrop mot ft.dk första gången:
@@ -103,7 +118,7 @@ Ordningen spelar roll; stegen 2–4 ändrar databasen och kan ta tid.
    python3 02_synka_oda.py --fas 1
    python3 02_synka_oda.py --fas 2
    ```
-4. Chunka och embedda nya dokument och dokument vars text ändrats (till exempel
+5. Chunka och embedda nya dokument och dokument vars text ändrats (till exempel
    när fas 2 hämtat PDF:en): `python3 04_chunka_och_embedda.py`.
 
 Därefter sköter den dagliga synken resten; ODA-synken fortsätter från förra

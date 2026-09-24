@@ -173,10 +173,11 @@ _CHUNK_HASH_NYCKEL = "migrering_chunk_hash"
 def _markera_chunk_hash() -> None:
     """Engångsmarkering: befintliga chunks antas höra till nuvarande text.
 
-    Utan den skulle alla redan chunkade dokument embeddas om efter
-    uppgraderingen. Dokument med chunks men utan hash får hashen av sin
-    nuvarande text; texter som ändras därefter chunkas om. Körs en gång per
-    databas och noteras i sync_status.
+    Dokument som chunkades före kolumnen har ingen hash och antas vara
+    aktuella, men då upptäcks inte heller senare textändringar. Markeringen
+    ger dem hashen av sin nuvarande text, så att texter som ändras därefter
+    chunkas om. Körs en gång per databas via migrera_data() och noteras i
+    sync_status.
     """
     if hamta_sync_status(_CHUNK_HASH_NYCKEL):
         return
@@ -213,8 +214,8 @@ def _markera_fulltext_kalla() -> None:
 
     Rader från före kolumnen fulltext_kalla har NULL där. De ODA-ärenden vars
     fulltext_md är identisk med resume har aldrig fått sin PDF, och markeras
-    'resume' så att fas 2 i ODA-synken tar dem. Körs en gång per databas,
-    vid första initieringen efter uppgraderingen, och noteras i sync_status.
+    'resume' så att fas 2 i ODA-synken tar dem. Körs en gång per databas
+    via migrera_data() och noteras i sync_status.
     """
     if hamta_sync_status(_MARKERING_NYCKEL):
         return
@@ -271,10 +272,30 @@ def initialisera_schema():
         finally:
             conn.close()
 
-    _markera_fulltext_kalla()
-    _markera_chunk_hash()
+    # Uppstarten gör bara snabba, idempotenta schemaändringar. MCP-klienten
+    # väntar en begränsad tid på serverns svar, så
+    # dataskrivningar över hela tabeller hör hemma i migrera_data(). Den
+    # automatiska halfvec-konverteringen gäller bara tabeller med högst
+    # AUTO_KONVERTERA_MAX_RADER vektorer och tar några sekunder.
     if _ar_postgres():
         _migrera_halfvec()
+
+
+def migrera_data() -> None:
+    """Engångsuppdateringar av befintliga rader efter en uppgradering.
+
+    Körs uttryckligen (python3 db.py --migrera) och i början av
+    02_synka_oda.py och 04_chunka_och_embedda.py, aldrig vid serverns
+    uppstart: på en stor databas tar de mer än en minut. Varje steg noteras i
+    sync_status och körs bara en gång; ett avbrutet steg rullas tillbaka och
+    görs om nästa gång.
+
+    Servern och skripten fungerar innan stegen körts: ett ODA-ärende utan
+    fulltext_kalla väljs inte av fas 2 (som före uppgraderingen), och ett
+    dokument med chunks men utan chunk_hash antas vara aktuellt.
+    """
+    _markera_fulltext_kalla()
+    _markera_chunk_hash()
 
 
 # ---------------------------------------------------------------------------
@@ -756,3 +777,18 @@ def hamta_andringar_for_lag(eli_url: str) -> list[dict]:
     return resultat
 
 
+if __name__ == "__main__":
+    import argparse
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="Databasschema och engångsmigreringar")
+    parser.add_argument("--migrera", action="store_true",
+                        help="Initiera schemat och kör engångsuppdateringarna av befintliga rader")
+    args = parser.parse_args()
+    if not args.migrera:
+        parser.print_help()
+        raise SystemExit(0)
+    initialisera_schema()
+    migrera_data()
+    logging.info("fulltext_kalla: %s", hamta_sync_status(_MARKERING_NYCKEL))
+    logging.info("chunk_hash: %s", hamta_sync_status(_CHUNK_HASH_NYCKEL))

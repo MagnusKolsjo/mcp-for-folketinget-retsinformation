@@ -78,6 +78,16 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- **Serverns uppstart gör inga tunga dataskrivningar.** Engångsmarkeringarna
+  av `fulltext_kalla` och `chunk_hash` gick i `initialisera_schema()` och tog
+  över en minut på en stor databas; MCP-klienten slutade vänta efter 60 s, avbröt
+  processen och samma sak upprepades vid varje start. De ligger nu i
+  `db.migrera_data()`, som körs med `python3 db.py --migrera` och automatiskt i
+  början av `02_synka_oda.py` och `04_chunka_och_embedda.py`. Uppstarten gör
+  bara `ADD COLUMN IF NOT EXISTS` och den begränsade halfvec-konverteringen
+  (0,4 s mätt med 146 000 dokument och 700 000 chunks). Innan migreringen
+  körts antas dokument med chunks men utan `chunk_hash` vara aktuella, så att
+  inget embeddas om i onödan.
 - **`04_chunka_och_embedda.py` chunkar om dokument vars text ändrats.**
   Tidigare valdes bara dokument utan chunks, så när fas 2 i ODA-synken ersatte
   ett ärendes resume med PDF-texten behöll den semantiska sökningen vektorer

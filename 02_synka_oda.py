@@ -590,6 +590,7 @@ def main():
 
     logger.info("=== ODA-synk startad ===")
     db.initialisera_schema()
+    db.migrera_data()   # engångsuppdateringar efter uppgradering; snabb när de redan körts
 
     lyckad = True
     if args.fas is None or args.fas == 1:

@@ -207,6 +207,10 @@ def _dokument_att_chunka() -> list[dict]:
 
     chunk_hash är md5 av texten vid senaste chunkningen. I PostgreSQL görs
     jämförelsen i databasen; SQLite saknar md5(), och där jämförs i Python.
+
+    Ett dokument med chunks men utan chunk_hash har chunkats före kolumnen
+    fanns och antas vara aktuellt, så att inget embeddas om i onödan innan
+    db.migrera_data() gett det en hash.
     """
     p = db._prefix()
     with db._cursor() as cur:
@@ -215,18 +219,23 @@ def _dokument_att_chunka() -> list[dict]:
                 f"""SELECT d.id, d.titel, d.resume, d.fulltext_md
                     FROM {p}dokument d
                     WHERE (NULLIF(d.resume, '') IS NOT NULL OR NULLIF(d.fulltext_md, '') IS NOT NULL)
-                      AND d.chunk_hash IS DISTINCT FROM md5({db.CHUNKTEXT_SQL})
+                      AND CASE WHEN d.chunk_hash IS NULL
+                               THEN NOT EXISTS (SELECT 1 FROM {p}chunks c WHERE c.dok_id = d.id)
+                               ELSE d.chunk_hash <> md5({db.CHUNKTEXT_SQL}) END
                     ORDER BY d.id ASC"""
             )
             rader = cur.fetchall()
         else:
             cur.execute(
-                f"""SELECT id, titel, resume, fulltext_md, chunk_hash FROM {p}dokument
-                    WHERE COALESCE(resume, '') <> '' OR COALESCE(fulltext_md, '') <> ''
-                    ORDER BY id ASC"""
+                f"""SELECT d.id, d.titel, d.resume, d.fulltext_md, d.chunk_hash,
+                           EXISTS (SELECT 1 FROM {p}chunks c WHERE c.dok_id = d.id)
+                    FROM {p}dokument d
+                    WHERE COALESCE(d.resume, '') <> '' OR COALESCE(d.fulltext_md, '') <> ''
+                    ORDER BY d.id ASC"""
             )
             rader = [r[:4] for r in cur.fetchall()
-                     if r[4] != _text_hash(_chunktext(r[2], r[3]))]
+                     if ((not r[5]) if r[4] is None
+                         else r[4] != _text_hash(_chunktext(r[2], r[3])))]
     return [{"id": r[0], "titel": r[1], "resume": r[2], "fulltext_md": r[3]} for r in rader]
 
 
@@ -425,6 +434,7 @@ def main():
     BATCH_STORLEK = args.batchstorlek
 
     db.initialisera_schema()
+    db.migrera_data()   # engångsuppdateringar efter uppgradering; snabb när de redan körts
     logger.info("=== Chunkning och embedding startad ===")
     chunka_och_embedda(bara_resume=args.bara_resume)
     logger.info("=== Klar ===")
