@@ -205,7 +205,7 @@ def _spara_sag(sag: dict) -> None:
         beteckning = sag.get("nummer") or None
 
     resume_text = sag.get("resume") or None
-    db.upsert_dokument(
+    dok_id = db.upsert_dokument(
         kalla                 = "oda",
         extern_id             = str(sagid),
         beteckning            = beteckning,
@@ -224,11 +224,14 @@ def _spara_sag(sag: dict) -> None:
         afgoerelse            = sag.get("afgørelse") or None,
         begrundelse           = sag.get("begrundelse") or None,
         baggrundsmateriale    = sag.get("baggrundsmateriale") or None,
-        # resume är preliminär sökbar text för nya sager. En redan hämtad
-        # fulltext (PDF) får inte skrivas över när ett ärende uppdateras.
-        fulltext_md           = resume_text,
+        # En redan hämtad fulltext (PDF) får inte skrivas över när ett
+        # ärende uppdateras; resume sätts som preliminär text nedan.
+        fulltext_md           = None,
         behall_fulltext       = True,
     )
+    # resume är sökbar text tills fas 2 hämtat PDF:en; fulltext_kalla
+    # säger att den är preliminär.
+    db.satt_resume_som_fulltext(dok_id)
 
 
 def synka_sager_metadata(full: bool = False, sedan: str | None = None) -> bool:
@@ -328,7 +331,8 @@ def synka_sager_metadata(full: bool = False, sedan: str | None = None) -> bool:
 def synka_fulltext():
     """
     Hämtar fulltext-PDF för sager av typ lovforslag och beslutningsforslag
-    som saknar fulltext i databasen.
+    som saknar fulltext, eller vars fulltext bara är resume
+    (fulltext_kalla = 'resume').
     """
     if not _CURL_CFFI_OK:
         logger.error("curl-cffi saknas — avbryter fas 2")
@@ -341,21 +345,21 @@ def synka_fulltext():
     with db._cursor() as cur:
         typer_sql = ", ".join([f"'{_typeid_till_navn(t)}'" for t in FULLTEXT_TYPER])
         cur.execute(
-            f"""SELECT id, extern_id, typ, titel
+            f"""SELECT id, extern_id, typ, titel, fulltext_kalla
                 FROM {p}dokument
                 WHERE kalla = {ph}
-                  AND fulltext_md IS NULL
+                  AND (fulltext_md IS NULL OR fulltext_kalla = 'resume')
                   AND typ IN ({typer_sql})
                 ORDER BY id ASC""",
             ("oda",)
         )
         att_behandla = [
-            {"id": r[0], "extern_id": r[1], "typ": r[2], "titel": r[3]}
+            {"id": r[0], "extern_id": r[1], "typ": r[2], "titel": r[3], "kalla": r[4]}
             for r in cur.fetchall()
         ]
 
     totalt = len(att_behandla)
-    logger.info("Fas 2: %d sager saknar fulltext — hämtar dokument och PDF", totalt)
+    logger.info("Fas 2: %d sager saknar fulltext eller har bara resume — hämtar dokument och PDF", totalt)
 
     lyckade = 0
     misslyckade = 0
@@ -364,7 +368,7 @@ def synka_fulltext():
         sagid    = int(sag["extern_id"])
         dok_id   = sag["id"]
 
-        logger.info("[%d/%d] sagid=%d: %s", i, totalt, sagid, sag["titel"][:60])
+        logger.info("[%d/%d] sagid=%d: %s", i, totalt, sagid, (sag["titel"] or "")[:60])
 
         # Steg 1: hämta SagDokument
         try:
@@ -381,8 +385,7 @@ def synka_fulltext():
         sagdokument = sd_data.get("value", [])
         if not sagdokument:
             logger.info("  Inga dokument kopplade till sagid=%d", sagid)
-            # Markera som behandlad med tom text för att inte försöka igen
-            _uppdatera_fulltext(dok_id, "(ingen PDF hittad)")
+            _markera_ingen_pdf(dok_id)
             continue
 
         # Försök med de tre första dokumenten — ta det första som ger text
@@ -429,7 +432,8 @@ def synka_fulltext():
                 p = db._prefix()
                 ph = "%s" if db._ar_postgres() else "?"
                 cur.execute(
-                    f"UPDATE {p}dokument SET url = {ph}, fulltext_md = {ph} WHERE id = {ph}",
+                    f"UPDATE {p}dokument SET url = {ph}, fulltext_md = {ph}, "
+                    f"fulltext_kalla = 'pdf' WHERE id = {ph}",
                     (fil_url, text, dok_id)
                 )
 
@@ -441,7 +445,7 @@ def synka_fulltext():
         if not text_hittad:
             logger.warning("  Ingen PDF med text hittades för sagid=%d", sagid)
             misslyckade += 1
-            _uppdatera_fulltext(dok_id, "(ingen PDF hittad)")
+            _markera_ingen_pdf(dok_id)
 
         # Spara checkpoint var 100:e sag
         if i % 100 == 0:
@@ -455,14 +459,21 @@ def synka_fulltext():
     )
 
 
-def _uppdatera_fulltext(dok_id: int, text: str):
-    """Uppdaterar fulltext_md för ett dokument."""
+def _markera_ingen_pdf(dok_id: int):
+    """Markerar att PDF-hämtningen är gjord utan resultat, så att fas 2 inte
+    försöker igen.
+
+    Ett ärende som har resume behåller den som sökbar text; övriga får en
+    platshållare, eftersom NULL skulle välja ärendet igen.
+    """
     with db._cursor() as cur:
         p = db._prefix()
         ph = "%s" if db._ar_postgres() else "?"
         cur.execute(
-            f"UPDATE {p}dokument SET fulltext_md = {ph} WHERE id = {ph}",
-            (text, dok_id)
+            f"""UPDATE {p}dokument
+                SET fulltext_md = COALESCE(fulltext_md, {ph}), fulltext_kalla = 'ingen_pdf'
+                WHERE id = {ph}""",
+            ("(ingen PDF hittad)", dok_id)
         )
 
 

@@ -60,6 +60,20 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- **Fas 2 i ODA-synken hämtar PDF även för ärenden vars fulltext bara är
+  resume.** Fas 1 sparade resume som fulltext, och fas 2 valde bara ärenden
+  helt utan text, så lovforslag och beslutningsforslag med resume fick aldrig
+  sin PDF. Den nya kolumnen `fulltext_kalla` (`resume`, `pdf`, `ingen_pdf`)
+  säger varifrån texten kommer; fas 2 väljer ärenden utan text eller med
+  `resume`. En ändrad resume slår igenom så länge den är ärendets enda text.
+  Ett ärende där ingen PDF hittas behåller sin resume i stället för att den
+  ersätts med platshållaren "(ingen PDF hittad)".
+- **Schemaändring:** `fulltext_kalla` läggs till via migrationsblocket i
+  `db.py` (Postgres och SQLite). Vid första initieringen efter uppgraderingen
+  markeras befintliga ODA-rader vars fulltext är identisk med resume som
+  `resume`, en gång per databas (noteras i `sync_status` som
+  `migrering_fulltext_kalla`). Nästa fas 2 hämtar då PDF:er för dem, vilket
+  kan bli många anrop mot ft.dk första gången.
 - `03_synka_retsinformation.py` flyttar checkpointen
   (`retsinformation_senaste_synk`) bara när körningen gick igenom. Tidigare
   räknades ett misslyckat harvest-anrop som ett dygn utan ändringar, och

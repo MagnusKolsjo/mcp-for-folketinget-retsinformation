@@ -135,12 +135,48 @@ def _hamta_schema_ddl() -> str:
         )
 
 
-# Migration-block — töms inför första GitHub-publicering (alla kolumner och index
-# finns redan i bas-schemat). Framtida schemaändringar läggs till här som
-# ALTER TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS.
-_MIGRATION_POSTGRES = ""
+# Migration-block. Bas-schemat i db/schema_*.sql är låst sedan första
+# publiceringen; schemaändringar läggs till här som idempotenta satser.
+#
+# fulltext_kalla: varifrån fulltext_md kommer.
+#   'resume'    — ODA-ärendets resume, preliminär text tills PDF:en hämtats
+#   'pdf'       — extraherad ur ft.dk-PDF:en
+#   'ingen_pdf' — PDF-hämtningen är gjord utan resultat; texten är resume
+#                 eller en platshållare
+#   NULL        — okänd (Retsinformation-dokument och rader från före
+#                 kolumnen, se _markera_fulltext_kalla)
+_MIGRATION_POSTGRES = """
+ALTER TABLE danmark.dokument ADD COLUMN IF NOT EXISTS fulltext_kalla TEXT
+"""
 
-_MIGRATION_SQLITE = ""
+# SQLite saknar ADD COLUMN IF NOT EXISTS; felet när kolumnen redan finns
+# fångas i initialisera_schema().
+_MIGRATION_SQLITE = """
+ALTER TABLE dokument ADD COLUMN fulltext_kalla TEXT
+"""
+
+_MARKERING_NYCKEL = "migrering_fulltext_kalla"
+
+
+def _markera_fulltext_kalla() -> None:
+    """Engångsmarkering av befintliga ODA-rader vars fulltext är resume.
+
+    Rader från före kolumnen fulltext_kalla har NULL där. De ODA-ärenden vars
+    fulltext_md är identisk med resume har aldrig fått sin PDF, och markeras
+    'resume' så att fas 2 i ODA-synken tar dem. Körs en gång per databas,
+    vid första initieringen efter uppgraderingen, och noteras i sync_status.
+    """
+    if hamta_sync_status(_MARKERING_NYCKEL):
+        return
+    p = _prefix()
+    with _cursor() as cur:
+        cur.execute(
+            f"""UPDATE {p}dokument SET fulltext_kalla = 'resume'
+                WHERE kalla = 'oda' AND fulltext_kalla IS NULL
+                  AND fulltext_md IS NOT NULL AND fulltext_md = resume"""
+        )
+        antal = cur.rowcount
+    spara_sync_status(_MARKERING_NYCKEL, f"{_now()} ({antal} rader markerade 'resume')")
 
 
 def initialisera_schema():
@@ -184,6 +220,30 @@ def initialisera_schema():
             conn.commit()
         finally:
             conn.close()
+
+    _markera_fulltext_kalla()
+
+
+def satt_resume_som_fulltext(dok_id: int) -> None:
+    """Låter ett ODA-ärendes resume vara dess preliminära fulltext.
+
+    Nya ärenden och ärenden som fortfarande bara har resume som text får
+    fulltext_md = resume och fulltext_kalla = 'resume', så att en ändrad
+    resume slår igenom. En PDF-text ('pdf') eller en rad vars text inte är
+    resume rörs inte.
+    """
+    p = _prefix()
+    ph = "%s" if _ar_postgres() else "?"
+    with _cursor() as cur:
+        cur.execute(
+            f"""UPDATE {p}dokument
+                SET fulltext_md = resume, fulltext_kalla = 'resume'
+                WHERE id = {ph} AND resume IS NOT NULL
+                  AND (fulltext_kalla = 'resume'
+                       OR (fulltext_kalla IS NULL
+                           AND (fulltext_md IS NULL OR fulltext_md = resume)))""",
+            (dok_id,)
+        )
 
 
 # ---------------------------------------------------------------------------
