@@ -64,19 +64,49 @@ python3 02_synka_oda.py --installera-schema
 
 ## Semantisk sökning och vektorindex
 
-`dk_sok_semantisk` väljer varje dokuments närmaste chunk och sorterar
-dokumenten efter cosinusavstånd. Schemat skapar inget vektorindex på
-`danmark.embeddings`, så varje sökning jämför frågan med samtliga chunks
-(ett halvt miljon rader tar några sekunder). Ett HNSW-index snabbar upp
-sökningen men tar tid och minne att bygga, och skapas därför bara som ett
-medvetet val:
+Embeddings lagras som `halfvec(768)` (16-bitars flyttal, 1 540 byte per vektor)
+med ett HNSW-index (`m=16`, `ef_construction=64`). `dk_sok_semantisk` hämtar de
+närmaste chunkarna via indexet och grupperar dem per dokument;
+`dk_sok_i_dokument` sorterar exakt inom dokumentet. `hnsw.ef_search` sätts per
+fråga, standard 400 (`DK_HNSW_EF_SEARCH` i `.env`). Mätt på 60 000 embeddings:
+recall@10 0,94 mot exakt sökning, på några hundradels sekunder.
 
-```sql
-CREATE INDEX IF NOT EXISTS idx_emb_hnsw ON danmark.embeddings
-    USING hnsw (vektor vector_cosine_ops);
+Nya databaser och databaser med högst 50 000 vektorer konverteras automatiskt
+vid uppstart. En större databas med `vector(768)` fungerar som förut (exakt
+sökning över alla vektorer, långsamt) tills den konverterats:
+
+```bash
+python3 08_konvertera_vektorer.py --torrkorning   # tid, disk, minne och slutstorlek
+python3 08_konvertera_vektorer.py --minne 2GB     # omskrivning och HNSW-bygge
 ```
 
-Med indexet blir sökningen ungefärlig i stället för exakt.
+Tabellen `danmark.embeddings` är låst under omskrivningen; semantiska
+sökningar väntar tills den är klar. HNSW-bygget går mycket snabbare när grafen
+ryms i `maintenance_work_mem`: räkna med knappt 2 kB per vektor.
+
+## Uppgradering av en befintlig installation (från 1.2.0)
+
+Ordningen spelar roll; stegen 2–4 ändrar databasen och kan ta tid.
+
+1. Installera den nya koden och `requirements.txt` (mcp 2.x) och starta servern
+   en gång. Uppstarten lägger till kolumnen `fulltext_kalla` och markerar
+   ODA-ärenden vars fulltext bara är resume. Lagrar databasen embeddings som
+   `vector` loggas att `08_konvertera_vektorer.py` behövs; servern fungerar ändå.
+2. Byt vektorlagringen: `python3 08_konvertera_vektorer.py --torrkorning`,
+   därefter `python3 08_konvertera_vektorer.py --minne 2GB`.
+3. Kör ODA-synken. Den första körningen saknar checkpoint för `opdateringsdato`
+   och hämtar därför alla ärenden (cirka 100 000, ungefär 1 000 anrop mot ODA).
+   Fas 2 hämtar sedan PDF för alla lovforslag och beslutningsforslag som bara
+   har resume, vilket kan bli många anrop mot ft.dk första gången:
+
+   ```bash
+   python3 02_synka_oda.py --fas 1
+   python3 02_synka_oda.py --fas 2
+   ```
+4. Chunka och embedda det som saknas: `python3 04_chunka_och_embedda.py`.
+
+Därefter sköter den dagliga synken resten; ODA-synken fortsätter från förra
+lyckade körningen.
 
 ## Transport: stdio eller http
 
