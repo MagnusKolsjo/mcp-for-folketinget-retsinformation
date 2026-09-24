@@ -37,6 +37,9 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Tillagt
 
+- Retsinformation synkas fortsatt via harvest-API:et. ELI Atom-feeden som
+  Civilstyrelsen annonserat har ingen dokumenterad eller hittbar adress
+  (kontrollerat 2026-09-24); skälen står i `03_synka_retsinformation.py`.
 - **Inkrementell ODA-synk på `opdateringsdato`.** `02_synka_oda.py --fas 1`
   hämtar ärenden som ändrats sedan förra lyckade körningen, inte bara ärenden
   med högre id än förut. Ändrade ärenden (ny status, resume, afgørelse)

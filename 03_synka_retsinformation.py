@@ -13,6 +13,16 @@ API-egenskaper (verifierade 2026-05-16):
   - Returnerar INTE titel eller fulltext — bara metadata + href till ELI-XML
   - ELI-XML hämtas separat och parsas för titel + fulltext
 
+Varför harvest-API:et och inte ELI Atom-feeden: Civilstyrelsen annonserade
+2024 "ELI channels" med sitemap och Atom-feed, men feeden har ingen
+dokumenterad adress. Kontroll 2026-09-24: den finns inte i robots.txt, i
+sitemap-indexet, i webbplatsens ELI-dokumentation eller i dess
+JavaScript, och /eli/atom och /eli/feed ger bara webbplatsens startsida.
+Harvest-API:et är dokumenterat och ger ändringar per dygn, inklusive
+borttagna dokument. Dess gräns på tio dagar hanteras genom att
+checkpointen bara flyttas vid lyckad körning; efter längre avbrott täcker
+05_synka_retsinformation_sitemap.py luckan.
+
 Delta-synk: skriptet itererar dag för dag bakåt och framåt.
 Första körning: hämtar de senaste 10 dagarna (API-max för historik).
 Därefter: daglig körning utan parametrar hämtar gårdagens ändringar.
