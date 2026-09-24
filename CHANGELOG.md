@@ -37,6 +37,21 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Tillagt
 
+- **Embeddings som `halfvec(768)` med HNSW-index.** `danmark.embeddings` saknade
+  vektorindex, så varje semantisk sökning läste alla vektorer ur TOAST
+  (drygt 20 s i driften). halfvec tar 1 540 byte per vektor i stället för
+  3 076 och ryms i själva tabellen. HNSW (m=16, ef_construction=64) ger
+  sökningar på några hundradels sekunder. `hnsw.ef_search` sätts per fråga,
+  standard 400 (`DK_HNSW_EF_SEARCH`), och höjs till minst antalet kandidater.
+  Mätt på 60 000 embeddings ur driften: halfvec ger samma topp-10 som vector
+  (recall@10 0,993); med HNSW är recall@10 0,94 för chunks och 0,92 för
+  dokument, mot 0,82 med ef_search 100.
+- Servern och embeddingskriptet läser kolumntypen och fungerar både före och
+  efter konverteringen. Tabeller med högst 50 000 vektorer konverteras
+  automatiskt vid uppstart; större med `08_konvertera_vektorer.py`.
+- `dk_sok_semantisk` hämtar de närmaste chunkarna med en indexvänlig fråga och
+  grupperar dem per dokument; `dk_sok_i_dokument` sorterar exakt inom
+  dokumentet utan att gå via indexet.
 - Retsinformation synkas fortsatt via harvest-API:et. ELI Atom-feeden som
   Civilstyrelsen annonserat har ingen dokumenterad eller hittbar adress
   (kontrollerat 2026-09-24); skälen står i `03_synka_retsinformation.py`.

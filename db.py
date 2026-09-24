@@ -222,6 +222,121 @@ def initialisera_schema():
             conn.close()
 
     _markera_fulltext_kalla()
+    if _ar_postgres():
+        _migrera_halfvec()
+
+
+# ---------------------------------------------------------------------------
+# Vektorlagring: vector eller halfvec
+# ---------------------------------------------------------------------------
+# Embeddings lagras som halfvec(768), 16-bitars flyttal: 1 540 byte per vektor
+# i stället för 3 076. En vector(768) är större än PostgreSQL:s gräns för
+# rader i tabellen och hamnar i TOAST, medan halfvec ryms i själva tabellen.
+# Träffsäkerheten för cosinussökning påverkas inte mätbart.
+#
+# Bas-schemat skapar kolumnen som vector(768). Nya och små databaser
+# konverteras vid uppstart; större med 08_konvertera_vektorer.py, eftersom
+# omskrivningen tar tid och disk. Frågorna läser kolumntypen och castar
+# frågevektorn därefter, så servern fungerar både före och efter.
+#
+# Index: HNSW (m=16, ef_construction=64). Utan vektorindex jämför varje
+# sökning frågan med samtliga vektorer.
+
+VEKTOR_DIM = 768
+HNSW_M = 16
+HNSW_EF_CONSTRUCTION = 64
+# ef_search 400: mätt på 60 000 embeddings ur driften gav 100 recall@10 0,82
+# (enstaka frågor 0), 400 gav 0,95 på 8 ms. Korpusen har många nästan
+# identiska chunks (7 % dubblettvektorer), vilket gör grafen svårare att
+# söka; en större kandidatlista kompenserar.
+HNSW_EF_SEARCH = int(os.getenv("DK_HNSW_EF_SEARCH", "400"))
+VEKTORINDEX_NAMN = "idx_danmark_embeddings_hnsw"
+
+# Under den här storleken konverteras kolumnen automatiskt vid uppstart.
+AUTO_KONVERTERA_MAX_RADER = 50_000
+
+
+def vektortyp(cur=None) -> str:
+    """'halfvec' eller 'vector' för danmark.embeddings.vektor."""
+    sql = """SELECT format_type(a.atttypid, a.atttypmod)
+             FROM pg_attribute a
+             WHERE a.attrelid = 'danmark.embeddings'::regclass AND a.attname = 'vektor'"""
+    if cur is not None:
+        cur.execute(sql)
+        rad = cur.fetchone()
+    else:
+        with _cursor() as c:
+            c.execute(sql)
+            rad = c.fetchone()
+    return "halfvec" if rad and rad[0].startswith("halfvec") else "vector"
+
+
+def sokinstallningar(cur, kandidater: int = 0) -> None:
+    """Sökparametrar för HNSW, gäller bara transaktionen.
+
+    ef_search är kandidatlistans storlek i grafsökningen och sätter taket för
+    hur många rader en indexsökning ger; den höjs därför till minst det antal
+    kandidater frågan ber om. Iterativ sökning fortsätter om ett filter eller
+    en JOIN sållar bort rader, i stället för att ge för få träffar.
+    """
+    ef = max(HNSW_EF_SEARCH, kandidater)
+    cur.execute(f"SET LOCAL hnsw.ef_search = {int(min(ef, 1000))}")
+    cur.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+
+
+def bygg_vektorindex(minne: Optional[str] = None, parallella: Optional[int] = None) -> None:
+    """Bygger om vektorindexet som HNSW med operatorklass efter kolumntypen.
+
+    HNSW-bygget går mycket snabbare när grafen ryms i maintenance_work_mem.
+    """
+    with _cursor() as cur:
+        typ = vektortyp(cur)
+        ops = "halfvec_cosine_ops" if typ == "halfvec" else "vector_cosine_ops"
+        if minne:
+            cur.execute("SET LOCAL maintenance_work_mem = %s", (minne,))
+        if parallella is not None:
+            cur.execute(f"SET LOCAL max_parallel_maintenance_workers = {int(parallella)}")
+        cur.execute(f"DROP INDEX IF EXISTS danmark.{VEKTORINDEX_NAMN}")
+        cur.execute(
+            f"CREATE INDEX {VEKTORINDEX_NAMN} ON danmark.embeddings "
+            f"USING hnsw (vektor {ops}) "
+            f"WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION})"
+        )
+
+
+def konvertera_till_halfvec(cur) -> None:
+    """Byter kolumnen till halfvec(768). Skriver om hela danmark.embeddings.
+
+    Ett befintligt vektorindex tas bort först, eftersom dess operatorklass
+    gäller vector. Anroparen bygger nytt index efteråt (bygg_vektorindex).
+    """
+    cur.execute(f"DROP INDEX IF EXISTS danmark.{VEKTORINDEX_NAMN}")
+    cur.execute(
+        f"ALTER TABLE danmark.embeddings ALTER COLUMN vektor "
+        f"TYPE halfvec({VEKTOR_DIM}) USING vektor::halfvec({VEKTOR_DIM})"
+    )
+
+
+def _migrera_halfvec() -> None:
+    """Konverterar små tabeller vid uppstart; stora lämnas till skriptet."""
+    import logging
+    log = logging.getLogger(__name__)
+    with _cursor() as cur:
+        if vektortyp(cur) == "halfvec":
+            return
+        cur.execute(
+            f"SELECT count(*) FROM (SELECT 1 FROM danmark.embeddings "
+            f"LIMIT {AUTO_KONVERTERA_MAX_RADER + 1}) x"
+        )
+        if cur.fetchone()[0] > AUTO_KONVERTERA_MAX_RADER:
+            log.info(
+                "danmark.embeddings lagrar vektorer som vector och saknar HNSW-index. "
+                "Kör 08_konvertera_vektorer.py för att byta till halfvec."
+            )
+            return
+        konvertera_till_halfvec(cur)
+    bygg_vektorindex()
+    log.info("danmark.embeddings konverterad till halfvec(%d) med HNSW-index", VEKTOR_DIM)
 
 
 def satt_resume_som_fulltext(dok_id: int) -> None:

@@ -178,10 +178,11 @@ def _spara_embeddings(chunk_ids: list[int], vektorer: list[list[float]]):
         return  # SQLite-installation har ingen pgvector
     p = db._prefix()
     with db._cursor() as cur:
+        typ = db.vektortyp(cur)   # vector före konverteringen, halfvec efter
         for chunk_id, vektor in zip(chunk_ids, vektorer):
             cur.execute(
                 f"""INSERT INTO {p}embeddings (chunk_id, vektor)
-                    VALUES (%s, %s::vector)
+                    VALUES (%s, %s::{typ})
                     ON CONFLICT (chunk_id) DO UPDATE SET vektor = EXCLUDED.vektor""",
                 (chunk_id, str(vektor))
             )
@@ -270,37 +271,64 @@ def chunka_och_embedda(bara_resume: bool = False):
 def semantisk_sok(sokterm: str, limit: int = 20) -> list[dict]:
     """
     Semantisk sökning via pgvector — hittar chunks närmast söktermens embedding.
-    Returnerar topp-N dokument (avduplicerade på dok_id).
+    Returnerar topp-N dokument (avduplicerade på dok_id), närmast först.
     """
     if not db._ar_postgres():
         return []
+    return semantisk_sok_med_vektor(_generera_embeddings([sokterm])[0], limit)
 
-    vektor = _generera_embeddings([sokterm])[0]
+
+# Kandidatchunks per sökt dokument. Ett dokument har ofta flera närliggande
+# chunks, så fler chunks än dokument behövs för att få ihop limit dokument.
+_KANDIDATER_PER_DOKUMENT = 10
+_MAX_KANDIDATER = 1000
+
+
+def semantisk_sok_med_vektor(vektor: list[float], limit: int = 20) -> list[dict]:
+    """
+    Dokumentsökning med en färdig frågevektor.
+
+    Den inre frågan hämtar de närmaste chunkarna med ORDER BY avstånd och
+    LIMIT, den form som HNSW-indexet kan besvara utan att läsa alla vektorer.
+    Chunkarna grupperas sedan per dokument, och varje dokument får sin
+    närmaste chunks avstånd. Räcker kandidaterna inte till limit olika
+    dokument dubblas antalet, upp till _MAX_KANDIDATER. Utan index (före
+    konverteringen) blir samma fråga en exakt genomläsning av alla vektorer.
+    """
     p = db._prefix()
-
-    # DISTINCT ON kräver att sorteringen börjar på dok_id. Den inre frågan
-    # väljer därför dokumentets närmaste chunk, och den yttre sorterar
-    # dokumenten efter avstånd. Utan den yttre sorteringen blir resultatet
-    # de dokument som har lägst id, inte de mest relevanta.
-    with db._cursor() as cur:
-        cur.execute(
-            f"""SELECT * FROM (
-                    SELECT DISTINCT ON (c.dok_id)
-                        d.id, d.kalla, d.beteckning, d.typ, d.titel, d.titelkort,
-                        d.periode, d.datum, d.url, d.retsinformationsurl,
-                        d.lovnummer, d.resume, d.paragrafnummer,
-                        (e.vektor <=> %s::vector) AS avstand
-                    FROM {p}embeddings e
-                    JOIN {p}chunks c ON c.id = e.chunk_id
-                    JOIN {p}dokument d ON d.id = c.dok_id
-                    ORDER BY c.dok_id, avstand ASC
-                ) narmaste_per_dokument
-                ORDER BY avstand ASC
-                LIMIT %s""",
-            (str(vektor), limit)
-        )
-        kolumner = [desc[0] for desc in cur.description]
-        return [dict(zip(kolumner, rad)) for rad in cur.fetchall()]
+    vektor_str = str(vektor)
+    kandidater = max(limit * _KANDIDATER_PER_DOKUMENT, 100)
+    while True:
+        with db._cursor() as cur:
+            typ = db.vektortyp(cur)
+            db.sokinstallningar(cur, kandidater)
+            cur.execute(
+                f"""WITH narmast AS (
+                        SELECT e.chunk_id, (e.vektor <=> %s::{typ}) AS avstand
+                        FROM {p}embeddings e
+                        ORDER BY e.vektor <=> %s::{typ}
+                        LIMIT %s
+                    )
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (d.id)
+                            d.id, d.kalla, d.beteckning, d.typ, d.titel, d.titelkort,
+                            d.periode, d.datum, d.url, d.retsinformationsurl,
+                            d.lovnummer, d.resume, d.paragrafnummer,
+                            n.avstand
+                        FROM narmast n
+                        JOIN {p}chunks c ON c.id = n.chunk_id
+                        JOIN {p}dokument d ON d.id = c.dok_id
+                        ORDER BY d.id, n.avstand ASC
+                    ) narmaste_per_dokument
+                    ORDER BY avstand ASC
+                    LIMIT %s""",
+                (vektor_str, vektor_str, kandidater, limit)
+            )
+            kolumner = [desc[0] for desc in cur.description]
+            rader = [dict(zip(kolumner, rad)) for rad in cur.fetchall()]
+        if len(rader) >= limit or kandidater >= _MAX_KANDIDATER:
+            return rader
+        kandidater = min(kandidater * 2, _MAX_KANDIDATER)
 
 
 def semantisk_sok_i_dokument(dok_id: int, fraga: str, limit: int = 5) -> dict:
@@ -346,15 +374,19 @@ def semantisk_sok_i_dokument(dok_id: int, fraga: str, limit: int = 5) -> dict:
     vektor = _generera_embeddings([fraga])[0]
 
     with db._cursor() as cur:
+        typ = db.vektortyp(cur)
+        # "+ 0" hindrar planeraren från att använda HNSW-indexet: inom ett
+        # dokument är en exakt sortering av dess chunks snabb, medan indexet
+        # plus dokumentfiltret kan ge för få träffar.
         cur.execute(
             f"""SELECT c.chunk_nr, c.text,
-                       (e.vektor <=> %s::vector) AS avstand
+                       (e.vektor <=> %s::{typ}) AS avstand
                 FROM {p}embeddings e
                 JOIN {p}chunks c ON c.id = e.chunk_id
                 WHERE c.dok_id = %s
-                ORDER BY avstand ASC
+                ORDER BY (e.vektor <=> %s::{typ}) + 0
                 LIMIT %s""",
-            (str(vektor), dok_id, limit)
+            (str(vektor), dok_id, str(vektor), limit)
         )
         kolumner = [desc[0] for desc in cur.description]
         traffar = [dict(zip(kolumner, rad)) for rad in cur.fetchall()]
