@@ -14,6 +14,7 @@ Användning:
 """
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -144,80 +145,103 @@ def _generera_embeddings(texter: list[str]) -> list[list[float]]:
 # Spara chunks och embeddings
 # ---------------------------------------------------------------------------
 
-def _spara_chunks(dok_id: int, chunks: list[str]) -> list[int]:
-    """Sparar chunks i DB och returnerar deras id:n."""
+def _chunktext(resume: str | None, fulltext: str | None, bara_resume: bool = False) -> str:
+    """Texten som chunkas: resume följt av fulltexten, eller den som finns.
+
+    Samma regel som db.CHUNKTEXT_SQL; ändras den ena måste den andra följa,
+    annars chunkas alla dokument om.
+    """
+    if bara_resume:
+        return resume or ""
+    if resume and fulltext:
+        return resume + "\n\n" + fulltext
+    return fulltext or resume or ""
+
+
+def _text_hash(text: str) -> str:
+    """md5 av texten i UTF-8, samma värde som PostgreSQL:s md5() ger."""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _spara_chunks_och_embeddings(dok_id: int, chunks: list[str],
+                                 vektorer: list[list[float]], text_hash: str) -> None:
+    """Ersätter dokumentets chunks och embeddings och sparar textens hash.
+
+    Allt sker i en transaktion: gamla chunks tas bort (embeddings följer med
+    via ON DELETE CASCADE), nya skrivs, och chunk_hash sätts. Avbryts något
+    står dokumentet kvar med sina gamla chunks och gamla hash och väljs igen
+    vid nästa körning.
+    """
     p  = db._prefix()
-    ph = "%s" if db._ar_postgres() else "?"
-    chunk_ids = []
+    pg = db._ar_postgres()
+    ph = "%s" if pg else "?"
     with db._cursor() as cur:
-        # Radera gamla chunks för detta dokument
         cur.execute(f"DELETE FROM {p}chunks WHERE dok_id = {ph}", (dok_id,))
-        for nr, text in enumerate(chunks):
-            if db._ar_postgres():
+        typ = db.vektortyp(cur) if pg else None   # vector före konverteringen, halfvec efter
+        for nr, (text, vektor) in enumerate(zip(chunks, vektorer)):
+            if pg:
                 cur.execute(
                     f"INSERT INTO {p}chunks (dok_id, chunk_nr, text) VALUES (%s, %s, %s) RETURNING id",
                     (dok_id, nr, text)
                 )
-                chunk_ids.append(cur.fetchone()[0])
-            else:
+                chunk_id = cur.fetchone()[0]
                 cur.execute(
-                    f"INSERT OR REPLACE INTO {p}chunks (dok_id, chunk_nr, text) VALUES (?, ?, ?)",
+                    f"INSERT INTO {p}embeddings (chunk_id, vektor) VALUES (%s, %s::{typ})",
+                    (chunk_id, str(vektor))
+                )
+            else:
+                # SQLite-installationen har ingen embeddings-tabell
+                cur.execute(
+                    f"INSERT INTO {p}chunks (dok_id, chunk_nr, text) VALUES (?, ?, ?)",
                     (dok_id, nr, text)
                 )
-                cur.execute(
-                    f"SELECT id FROM {p}chunks WHERE dok_id = {ph} AND chunk_nr = {ph}",
-                    (dok_id, nr)
-                )
-                chunk_ids.append(cur.fetchone()[0])
-    return chunk_ids
-
-
-def _spara_embeddings(chunk_ids: list[int], vektorer: list[list[float]]):
-    """Sparar embeddings i danmark.embeddings (bara PostgreSQL)."""
-    if not db._ar_postgres():
-        return  # SQLite-installation har ingen pgvector
-    p = db._prefix()
-    with db._cursor() as cur:
-        typ = db.vektortyp(cur)   # vector före konverteringen, halfvec efter
-        for chunk_id, vektor in zip(chunk_ids, vektorer):
-            cur.execute(
-                f"""INSERT INTO {p}embeddings (chunk_id, vektor)
-                    VALUES (%s, %s::{typ})
-                    ON CONFLICT (chunk_id) DO UPDATE SET vektor = EXCLUDED.vektor""",
-                (chunk_id, str(vektor))
-            )
+        cur.execute(f"UPDATE {p}dokument SET chunk_hash = {ph} WHERE id = {ph}", (text_hash, dok_id))
 
 
 # ---------------------------------------------------------------------------
 # Huvudlogik
 # ---------------------------------------------------------------------------
 
+def _dokument_att_chunka() -> list[dict]:
+    """Dokument vars text har ändrats sedan de chunkades, eller aldrig chunkats.
+
+    chunk_hash är md5 av texten vid senaste chunkningen. I PostgreSQL görs
+    jämförelsen i databasen; SQLite saknar md5(), och där jämförs i Python.
+    """
+    p = db._prefix()
+    with db._cursor() as cur:
+        if db._ar_postgres():
+            cur.execute(
+                f"""SELECT d.id, d.titel, d.resume, d.fulltext_md
+                    FROM {p}dokument d
+                    WHERE (NULLIF(d.resume, '') IS NOT NULL OR NULLIF(d.fulltext_md, '') IS NOT NULL)
+                      AND d.chunk_hash IS DISTINCT FROM md5({db.CHUNKTEXT_SQL})
+                    ORDER BY d.id ASC"""
+            )
+            rader = cur.fetchall()
+        else:
+            cur.execute(
+                f"""SELECT id, titel, resume, fulltext_md, chunk_hash FROM {p}dokument
+                    WHERE COALESCE(resume, '') <> '' OR COALESCE(fulltext_md, '') <> ''
+                    ORDER BY id ASC"""
+            )
+            rader = [r[:4] for r in cur.fetchall()
+                     if r[4] != _text_hash(_chunktext(r[2], r[3]))]
+    return [{"id": r[0], "titel": r[1], "resume": r[2], "fulltext_md": r[3]} for r in rader]
+
+
 def chunka_och_embedda(bara_resume: bool = False):
     """
-    Hämtar dokument utan chunks, chunkar deras text och genererar embeddings.
+    Chunkar och embeddar dokument som aldrig chunkats eller vars text ändrats
+    sedan förra chunkningen, till exempel när fas 2 i ODA-synken ersatt ett
+    ärendes resume med PDF-texten. Gamla chunks och embeddings ersätts.
     bara_resume=True: använder bara resume-fältet (snabbare, för test).
     """
-    p  = db._prefix()
-    ph = "%s" if db._ar_postgres() else "?"
-
-    # Hämta dokument som saknar chunks
-    with db._cursor() as cur:
-        cur.execute(
-            f"""SELECT d.id, d.titel, d.resume, d.fulltext_md
-                FROM {p}dokument d
-                LEFT JOIN {p}chunks c ON c.dok_id = d.id
-                WHERE c.id IS NULL
-                  AND (d.resume IS NOT NULL OR d.fulltext_md IS NOT NULL)
-                ORDER BY d.id ASC"""
-        )
-        att_behandla = [
-            {"id": r[0], "titel": r[1], "resume": r[2], "fulltext_md": r[3]}
-            for r in cur.fetchall()
-        ]
+    att_behandla = _dokument_att_chunka()
 
     totalt  = len(att_behandla)
     lyckade = 0
-    logger.info("Chunkning: %d dokument att behandla", totalt)
+    logger.info("Chunkning: %d dokument att behandla (nya eller med ändrad text)", totalt)
 
     if totalt == 0:
         logger.info("Inga dokument att chunka — allt redan klart eller saknar text.")
@@ -229,29 +253,14 @@ def chunka_och_embedda(bara_resume: bool = False):
     for i, dok in enumerate(att_behandla, 1):
         dok_id = dok["id"]
         titel  = (dok["titel"] or "")[:60]
-
-        # Välj text: fulltext_md om tillgängligt, annars resume
-        if bara_resume or not dok.get("fulltext_md"):
-            text = dok.get("resume") or ""
-        else:
-            text = dok["fulltext_md"]
-
-        # Lägg alltid till resume i början om det finns och vi kör fulltext
-        if not bara_resume and dok.get("resume") and dok.get("fulltext_md"):
-            text = dok["resume"] + "\n\n" + dok["fulltext_md"]
-
-        if not text.strip():
-            continue
-
-        chunks = _chunka_text(text)
-        if not chunks:
-            continue
+        text   = _chunktext(dok.get("resume"), dok.get("fulltext_md"), bara_resume)
+        chunks = _chunka_text(text) if text.strip() else []
 
         try:
-            vektorer  = _generera_embeddings(chunks)
-            chunk_ids = _spara_chunks(dok_id, chunks)
-            if db._ar_postgres():
-                _spara_embeddings(chunk_ids, vektorer)
+            # Ger texten inga chunks sparas ändå hashen (och gamla chunks tas
+            # bort), så att dokumentet inte väljs vid varje körning.
+            vektorer = _generera_embeddings(chunks) if chunks else []
+            _spara_chunks_och_embeddings(dok_id, chunks, vektorer, _text_hash(text))
             lyckade += 1
 
             if i % 50 == 0 or i == totalt:

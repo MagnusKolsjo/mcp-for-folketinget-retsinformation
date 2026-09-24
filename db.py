@@ -145,15 +145,65 @@ def _hamta_schema_ddl() -> str:
 #                 eller en platshållare
 #   NULL        — okänd (Retsinformation-dokument och rader från före
 #                 kolumnen, se _markera_fulltext_kalla)
+#
+# chunk_hash: md5 av texten när dokumentet senast chunkades
+#   (se CHUNKTEXT_SQL). Avviker den från nuvarande text chunkas dokumentet om.
 _MIGRATION_POSTGRES = """
-ALTER TABLE danmark.dokument ADD COLUMN IF NOT EXISTS fulltext_kalla TEXT
+ALTER TABLE danmark.dokument ADD COLUMN IF NOT EXISTS fulltext_kalla TEXT;
+ALTER TABLE danmark.dokument ADD COLUMN IF NOT EXISTS chunk_hash TEXT
 """
 
 # SQLite saknar ADD COLUMN IF NOT EXISTS; felet när kolumnen redan finns
 # fångas i initialisera_schema().
 _MIGRATION_SQLITE = """
-ALTER TABLE dokument ADD COLUMN fulltext_kalla TEXT
+ALTER TABLE dokument ADD COLUMN fulltext_kalla TEXT;
+ALTER TABLE dokument ADD COLUMN chunk_hash TEXT
 """
+
+# Texten som chunkas, uttryckt i SQL: resume följt av fulltexten, eller den
+# som finns. Motsvarar _chunktext() i 04_chunka_och_embedda.py.
+CHUNKTEXT_SQL = (
+    "CASE WHEN NULLIF(d.resume, '') IS NOT NULL AND NULLIF(d.fulltext_md, '') IS NOT NULL "
+    "THEN d.resume || E'\\n\\n' || d.fulltext_md "
+    "ELSE COALESCE(NULLIF(d.fulltext_md, ''), d.resume, '') END"
+)
+_CHUNK_HASH_NYCKEL = "migrering_chunk_hash"
+
+
+def _markera_chunk_hash() -> None:
+    """Engångsmarkering: befintliga chunks antas höra till nuvarande text.
+
+    Utan den skulle alla redan chunkade dokument embeddas om efter
+    uppgraderingen. Dokument med chunks men utan hash får hashen av sin
+    nuvarande text; texter som ändras därefter chunkas om. Körs en gång per
+    databas och noteras i sync_status.
+    """
+    if hamta_sync_status(_CHUNK_HASH_NYCKEL):
+        return
+    p = _prefix()
+    if _ar_postgres():
+        with _cursor() as cur:
+            cur.execute(
+                f"""UPDATE {p}dokument d SET chunk_hash = md5({CHUNKTEXT_SQL})
+                    WHERE d.chunk_hash IS NULL
+                      AND EXISTS (SELECT 1 FROM {p}chunks c WHERE c.dok_id = d.id)"""
+            )
+            antal = cur.rowcount
+    else:
+        import hashlib
+        with _cursor() as cur:
+            cur.execute(
+                """SELECT d.id, d.resume, d.fulltext_md FROM dokument d
+                   WHERE d.chunk_hash IS NULL
+                     AND EXISTS (SELECT 1 FROM chunks c WHERE c.dok_id = d.id)"""
+            )
+            rader = cur.fetchall()
+            for dok_id, resume, fulltext in rader:
+                text = (resume + "\n\n" + fulltext) if resume and fulltext else (fulltext or resume or "")
+                cur.execute("UPDATE dokument SET chunk_hash = ? WHERE id = ?",
+                            (hashlib.md5(text.encode("utf-8")).hexdigest(), dok_id))
+            antal = len(rader)
+    spara_sync_status(_CHUNK_HASH_NYCKEL, f"{_now()} ({antal} dokument antagna aktuella)")
 
 _MARKERING_NYCKEL = "migrering_fulltext_kalla"
 
@@ -222,6 +272,7 @@ def initialisera_schema():
             conn.close()
 
     _markera_fulltext_kalla()
+    _markera_chunk_hash()
     if _ar_postgres():
         _migrera_halfvec()
 

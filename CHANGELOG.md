@@ -78,6 +78,16 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- **`04_chunka_och_embedda.py` chunkar om dokument vars text ändrats.**
+  Tidigare valdes bara dokument utan chunks, så när fas 2 i ODA-synken ersatte
+  ett ärendes resume med PDF-texten behöll den semantiska sökningen vektorer
+  byggda ur resume. Den nya kolumnen `chunk_hash` (md5 av texten vid
+  chunkningen, migration för Postgres och SQLite) jämförs med nuvarande text;
+  avvikande dokument chunkas om, och gamla chunks och embeddings ersätts i
+  samma transaktion som hashen sparas. Vid första initieringen efter
+  uppgraderingen antas befintliga chunks höra till nuvarande text (en gång per
+  databas, `migrering_chunk_hash` i `sync_status`), så att inte hela korpusen
+  embeddas om. Jämförelsen över alla dokument tar cirka 3 s i driften.
 - **Fas 2 i ODA-synken hämtar PDF även för ärenden vars fulltext bara är
   resume.** Fas 1 sparade resume som fulltext, och fas 2 valde bara ärenden
   helt utan text, så lovforslag och beslutningsforslag med resume fick aldrig

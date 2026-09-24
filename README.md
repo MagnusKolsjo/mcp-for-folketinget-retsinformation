@@ -103,7 +103,8 @@ Ordningen spelar roll; stegen 2–4 ändrar databasen och kan ta tid.
    python3 02_synka_oda.py --fas 1
    python3 02_synka_oda.py --fas 2
    ```
-4. Chunka och embedda det som saknas: `python3 04_chunka_och_embedda.py`.
+4. Chunka och embedda nya dokument och dokument vars text ändrats (till exempel
+   när fas 2 hämtat PDF:en): `python3 04_chunka_och_embedda.py`.
 
 Därefter sköter den dagliga synken resten; ODA-synken fortsätter från förra
 lyckade körningen.
