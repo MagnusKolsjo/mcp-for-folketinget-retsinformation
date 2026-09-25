@@ -177,6 +177,21 @@ längre texter läses i flera anrop.
 Läs vidare med `fran_tecken` tills hela passagen är hämtad. Standardvärdet kan
 sättas i `.env` med `DK_MAX_TECKEN`.
 
+## PDF-extraktion, OCR-språk och OCR-kö
+
+Folketingets PDF:er hämtas från ft.dk och extraheras med `pdftext_skydd.py`
+(delad mall, se `verktyg/mcp-2x/mallar/`). Extraktionen körs i en egen
+process per sidblock; en vakt i föräldraprocessen avbryter blocket om det
+passerar minnes- eller tidsgränsen (standard 3000 MB / 300 s), och läser då
+sidorna med ren textutvinning i stället för att fälla processen.
+
+Sidor utan textlager OCR:as med `DK_OCR_SPRAK` (standard `dan+eng`) — utan
+det skulle pymupdf4llm falla tillbaka på engelska och danska tecken bli fel.
+Dokument där minst en sida saknade textlager, eller där ett sidblock föll
+tillbaka på ren textutvinning, läggs i en OCR-kö: `ocr_ko/ko.jsonl` (en rad
+per dokument, med källa och orsak) och PDF-filen sparas i `ocr_ko/filer/`.
+Köade dokument kan köras genom en bättre OCR senare utan att laddas ned igen.
+
 ## Licens
 
 GNU Affero General Public License v3.0 — se LICENSE.

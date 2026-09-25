@@ -57,7 +57,7 @@ from pydantic import Field
 import db
 from mcp_annotationer import CACHE_HINTAR, LASNING_DB, LASNING_EXTERN
 from mcp_transport import starta
-from tyst_fd import tysta_fd
+from pdftext_skydd import extrahera_pdf
 
 try:
     import psycopg2
@@ -443,34 +443,20 @@ def _ar_ftdk_pdf(url: str) -> bool:
         and delar.path.lower().endswith(".pdf")
 
 
-def _extrahera_pdf_text(pdf_bytes: bytes) -> str:
-    """Extraherar text från PDF-bytes med pymupdf4llm.
+def _extrahera_pdf_text(pdf_bytes: bytes, *, kalla_id: str, kalla_url: str = "") -> str:
+    """Extraherar text från PDF-bytes under minnes- och tidsvakt, med dansk OCR.
 
     Kastar _FulltextFel med orsaken när ingen text kom ut.
     """
     try:
-        import tempfile
-        import pymupdf4llm
-    except ImportError as e:
-        logger.warning("pymupdf4llm saknas — PDF-extraktion ej tillgänglig")
-        raise _FulltextFel("pymupdf4llm är inte installerat på servern, så PDF:en kan inte läsas") from e
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            f.write(pdf_bytes)
-            tmp_vag = f.name
-        try:
-            # Låset i tysta_fd serialiserar också pymupdf-anropen, som inte
-            # tål att köras från flera trådar samtidigt.
-            with tysta_fd(_LOG_DIR / "subprocess.log"):
-                text = pymupdf4llm.to_markdown(tmp_vag)
-        finally:
-            os.unlink(tmp_vag)
+        res = extrahera_pdf(pdf_bytes, prefix="DK", standardsprak="dan+eng",
+                            kalla_id=kalla_id, kalla_url=kalla_url)
     except Exception as e:
         logger.error("PDF-extraktion misslyckades: %s", e)
         raise _FulltextFel(f"PDF:en kunde inte tolkas ({type(e).__name__}: {e})") from e
-    if not text.strip():
+    if not res.text.strip():
         raise _FulltextFel("PDF:en innehåller ingen extraherbar text, troligen en inskannad bild")
-    return text
+    return res.text
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +835,8 @@ def dk_hamta_dokument(
     elif not dok.get("fulltext_md"):
         logger.info("Hämtar PDF för dok %s: %s", dok.get("id"), dok.get("url"))
         try:
-            text = _extrahera_pdf_text(_hamta_pdf_bytes(dok["url"]))
+            text = _extrahera_pdf_text(_hamta_pdf_bytes(dok["url"]),
+                                       kalla_id=str(dok.get("id")), kalla_url=dok["url"])
         except _FulltextFel as fel:
             anmarkning = f"Fulltexten finns inte lokalt och kunde inte hämtas: {fel}. PDF: {dok['url']}"
         else:

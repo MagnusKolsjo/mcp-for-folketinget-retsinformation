@@ -8,6 +8,28 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ## [Unreleased]
 
+### Rättat
+
+- OCR-språket för sidor utan textlager var engelska (pymupdf4llms
+  standardvärde), eftersom ingen kod angav `ocr_language`. Danska tecken i
+  skannade sidor blev därför fel. `DK_OCR_SPRAK` (standard `dan+eng`) styr
+  nu språket explicit.
+
+### Tillagt
+
+- Minnes- och tidsvakt kring PDF-extraktionen (`pdftext_skydd.py`):
+  extraktionen körs i en egen process per sidblock, och ett block som
+  passerar minnes- eller tidsgränsen läses om med ren textutvinning i
+  stället för att fälla processen.
+- OCR-kö (`ocr_ko/ko.jsonl` + `ocr_ko/filer/`) för dokument där minst en
+  sida saknade textlager eller där ett block föll tillbaka på ren
+  textutvinning, så att de kan köras genom en bättre OCR senare.
+
+### Borttaget
+
+- Den odokumenterade `ocrmypdf`-reserven fanns aldrig i det här repot —
+  ingen ändring krävdes av den anledningen.
+
 ### Ändrat
 
 - **Brytande: MCP Python SDK 2.x krävs** (`mcp>=2.0,<3`). Servern är

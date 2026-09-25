@@ -21,12 +21,10 @@ Användning:
 """
 
 import argparse
-import contextlib
 import logging
 import os
 import sys
 import time
-import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -34,6 +32,8 @@ from dotenv import load_dotenv
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 load_dotenv(_SCRIPT_DIR / ".env")
+
+from pdftext_skydd import extrahera_pdf
 
 # Loggning till fil och stderr
 _LOG_DIR = _SCRIPT_DIR / "logs"
@@ -110,25 +110,6 @@ except ImportError:
     logger.error("curl-cffi saknas — installera med: pip install curl-cffi")
 
 
-@contextlib.contextmanager
-def _tysta_stdout():
-    """OS-nivå redirigering av FD 1+2 till loggfil (skyddar MCP-protokollet)."""
-    log_vag = _LOG_DIR / "subprocess.log"
-    save_out = os.dup(1)
-    save_err = os.dup(2)
-    log_fd   = os.open(str(log_vag), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.dup2(log_fd, 1)
-        os.dup2(log_fd, 2)
-        yield
-    finally:
-        os.dup2(save_out, 1)
-        os.dup2(save_err, 2)
-        os.close(save_out)
-        os.close(save_err)
-        os.close(log_fd)
-
-
 def _ladda_ned_pdf(url: str) -> bytes | None:
     """Laddar ned PDF från ft.dk med curl-cffi (kringgår Cloudflare)."""
     if not _CURL_CFFI_OK:
@@ -146,25 +127,12 @@ def _ladda_ned_pdf(url: str) -> bytes | None:
         return None
 
 
-def _extrahera_text(pdf_bytes: bytes) -> str | None:
-    """Extraherar text från PDF-bytes med pymupdf4llm."""
+def _extrahera_text(pdf_bytes: bytes, *, kalla_id: str, kalla_url: str = "") -> str | None:
+    """Extraherar text från PDF-bytes under minnes- och tidsvakt, med dansk OCR."""
     try:
-        import pymupdf4llm
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            f.write(pdf_bytes)
-            tmp = f.name
-        try:
-            with _tysta_stdout():
-                text = pymupdf4llm.to_markdown(tmp)
-            return text.strip() or None
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-    except ImportError:
-        logger.error("pymupdf4llm saknas")
-        return None
+        res = extrahera_pdf(pdf_bytes, prefix="DK", standardsprak="dan+eng",
+                            kalla_id=kalla_id, kalla_url=kalla_url)
+        return res.text.strip() or None
     except Exception as e:
         logger.error("Textextraktion misslyckades: %s", e)
         return None
@@ -422,7 +390,7 @@ def synka_fulltext():
             if not pdf_bytes:
                 continue
 
-            text = _extrahera_text(pdf_bytes)
+            text = _extrahera_text(pdf_bytes, kalla_id=str(dok_id), kalla_url=fil_url)
             if not text:
                 logger.warning("  Tom text för %s", fil_url)
                 continue
