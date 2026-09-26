@@ -76,12 +76,12 @@ INKLUDERA_TYPER = {"LOV", "LBK", "BEK", "CIR", "CIRK", "VEJ", "SKR"}
 
 _HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "mcp-for-folketinget-retsinformation/1.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
+    "User-Agent": "mcp-for-folketinget-retsinformation/2.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
 }
 
 _XML_HEADERS = {
     "Accept": "application/xml, text/xml, */*",
-    "User-Agent": "mcp-for-folketinget-retsinformation/1.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
+    "User-Agent": "mcp-for-folketinget-retsinformation/2.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
 }
 
 

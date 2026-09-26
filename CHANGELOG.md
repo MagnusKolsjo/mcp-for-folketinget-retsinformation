@@ -8,98 +8,14 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-09-26
+
 ### Rättat
 
 - OCR-språket för sidor utan textlager var engelska (pymupdf4llms
   standardvärde), eftersom ingen kod angav `ocr_language`. Danska tecken i
   skannade sidor blev därför fel. `DK_OCR_SPRAK` (standard `dan+eng`) styr
   nu språket explicit.
-
-### Tillagt
-
-- Minnes- och tidsvakt kring PDF-extraktionen (`pdftext_skydd.py`):
-  extraktionen körs i en egen process per sidblock, och ett block som
-  passerar minnes- eller tidsgränsen läses om med ren textutvinning i
-  stället för att fälla processen.
-- OCR-kö (`ocr_ko/ko.jsonl` + `ocr_ko/filer/`) för dokument där minst en
-  sida saknade textlager eller där ett block föll tillbaka på ren
-  textutvinning, så att de kan köras genom en bättre OCR senare.
-
-### Borttaget
-
-- Den odokumenterade `ocrmypdf`-reserven fanns aldrig i det här repot —
-  ingen ändring krävdes av den anledningen.
-
-### Ändrat
-
-- **Brytande: MCP Python SDK 2.x krävs** (`mcp>=2.0,<3`). Servern är
-  omskriven från lågnivå-`Server` med handskrivna scheman till `MCPServer`
-  med `@mcp.tool()`. Verktygsnamn, parametrar och beskrivningar är
-  oförändrade.
-- **Brytande: http-läget kör Streamable HTTP på `/mcp` och kräver
-  `MCP_API_KEY`.** Utan nyckel avbryts uppstarten med exitkod 2 i stället för
-  att servern startar oskyddad. Fel nyckel ger 403, saknad header 401.
-- **Brytande: förväntade fel är verktygsfel.** Okänt `dok_id`, `sagid` eller
-  `aktorid`, ODA som inte svarar, databasfel och semantisk sökning mot SQLite
-  ger nu `isError` med ett svenskt meddelande i stället för ett vanligt
-  textsvar. Klienter som tolkade feltexten som resultat behöver se över det.
-- **Brytande: `max_tecken` i `dk_hamta_dokument` har ett tak på 400 000
-  tecken**, och `0` betyder "så mycket som ryms" i stället för hela texten.
-  Svaret skickas nu både som JSON-text och som strukturerat innehåll, och
-  en hel lagtext på nära en miljon tecken skulle då spränga protokollets
-  gräns. Längre texter läses i flera anrop med `fran_tecken`.
-- Alla verktyg returnerar typade, strukturerade svar med utdataschema.
-  Textsvaret är samma JSON som förut. `dk_lista_perioder` ger en lista, som
-  skickas som ett textblock per period och strukturerat som `{"result": [...]}`;
-  `dk_hamta_dokument` och `dk_hamta_aktor`, som har två svarsformer, har
-  sitt strukturerade svar under `result`.
-- Verktygen körs på arbetstrådar i stället för att blockera servern, så att
-  flera anrop kan pågå samtidigt.
-- `requirements.txt` har versionsgränser.
-
-### Tillagt
-
-- `08_konvertera_vektorer.py` byter en befintlig databas till halfvec och
-  bygger HNSW-indexet. `--torrkorning` visar uppskattad tid, diskbehov, minne
-  och slutstorlek utan att ändra något; `--bara-index` bygger om indexet.
-- **Embeddings som `halfvec(768)` med HNSW-index.** `danmark.embeddings` saknade
-  vektorindex, så varje semantisk sökning läste alla vektorer ur TOAST
-  (drygt 20 s i driften). halfvec tar 1 540 byte per vektor i stället för
-  3 076 och ryms i själva tabellen. HNSW (m=16, ef_construction=64) ger
-  sökningar på några hundradels sekunder. `hnsw.ef_search` sätts per fråga,
-  standard 400 (`DK_HNSW_EF_SEARCH`), och höjs till minst antalet kandidater.
-  Mätt på 60 000 embeddings ur driften: halfvec ger samma topp-10 som vector
-  (recall@10 0,993); med HNSW är recall@10 0,94 för chunks och 0,92 för
-  dokument, mot 0,82 med ef_search 100.
-- Servern och embeddingskriptet läser kolumntypen och fungerar både före och
-  efter konverteringen. Tabeller med högst 50 000 vektorer konverteras
-  automatiskt vid uppstart; större med `08_konvertera_vektorer.py`.
-- `dk_sok_semantisk` hämtar de närmaste chunkarna med en indexvänlig fråga och
-  grupperar dem per dokument; `dk_sok_i_dokument` sorterar exakt inom
-  dokumentet utan att gå via indexet.
-- Retsinformation synkas fortsatt via harvest-API:et. ELI Atom-feeden som
-  Civilstyrelsen annonserat har ingen dokumenterad eller hittbar adress
-  (kontrollerat 2026-09-24); skälen står i `03_synka_retsinformation.py`.
-- **Inkrementell ODA-synk på `opdateringsdato`.** `02_synka_oda.py --fas 1`
-  hämtar ärenden som ändrats sedan förra lyckade körningen, inte bara ärenden
-  med högre id än förut. Ändrade ärenden (ny status, resume, afgørelse)
-  uppdateras därmed i databasen. Pagineringen sker på nyckel
-  (`opdateringsdato`, `id`) i stället för `$skip`, så att ett ärende som
-  uppdateras under körningen inte förskjuter sidorna. Checkpointen
-  (`oda_senaste_opdateringsdato`) flyttas bara fram när körningen lyckats;
-  vid fel avslutas skriptet med exitkod 1. `--full` hämtar alla ärenden,
-  `--sedan YYYY-MM-DD` ärenden ändrade sedan ett datum. Den första körningen
-  utan checkpoint är en full synk (cirka 100 000 ärenden, ungefär 1 000
-  anrop). Den tidigare nyckeln `oda_senaste_sagid` används inte längre.
-- `synk_daglig.sh` fortsätter med fulltext och embedding när ODA-steget
-  misslyckas, och loggar att checkpointen inte flyttades.
-- Titel och annotationer (`readOnlyHint`, `openWorldHint` m.fl.) på alla
-  verktyg, cachningshintar för verktygslistan och serverinstruktioner som
-  beskriver verktygskedjorna.
-- I http-läget laddas embeddingmodellen vid uppstart.
-
-### Rättat
-
 - **Serverns uppstart gör inga tunga dataskrivningar.** Engångsmarkeringarna
   av `fulltext_kalla` och `chunk_hash` gick i `initialisera_schema()` och tog
   över en minut på en stor databas; MCP-klienten slutade vänta efter 60 s, avbröt
@@ -186,11 +102,89 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
   inte längre på dokument utan typ.
 - Ingen FutureWarning från sentence-transformers 6 vid modellinläsning.
 
+### Tillagt
+
+- Minnes- och tidsvakt kring PDF-extraktionen (`pdftext_skydd.py`):
+  extraktionen körs i en egen process per sidblock, och ett block som
+  passerar minnes- eller tidsgränsen läses om med ren textutvinning i
+  stället för att fälla processen.
+- OCR-kö (`ocr_ko/ko.jsonl` + `ocr_ko/filer/`) för dokument där minst en
+  sida saknade textlager eller där ett block föll tillbaka på ren
+  textutvinning, så att de kan köras genom en bättre OCR senare.
+- `08_konvertera_vektorer.py` byter en befintlig databas till halfvec och
+  bygger HNSW-indexet. `--torrkorning` visar uppskattad tid, diskbehov, minne
+  och slutstorlek utan att ändra något; `--bara-index` bygger om indexet.
+- **Embeddings som `halfvec(768)` med HNSW-index.** `danmark.embeddings` saknade
+  vektorindex, så varje semantisk sökning läste alla vektorer ur TOAST
+  (drygt 20 s i driften). halfvec tar 1 540 byte per vektor i stället för
+  3 076 och ryms i själva tabellen. HNSW (m=16, ef_construction=64) ger
+  sökningar på några hundradels sekunder. `hnsw.ef_search` sätts per fråga,
+  standard 400 (`DK_HNSW_EF_SEARCH`), och höjs till minst antalet kandidater.
+  Mätt på 60 000 embeddings ur driften: halfvec ger samma topp-10 som vector
+  (recall@10 0,993); med HNSW är recall@10 0,94 för chunks och 0,92 för
+  dokument, mot 0,82 med ef_search 100.
+- Servern och embeddingskriptet läser kolumntypen och fungerar både före och
+  efter konverteringen. Tabeller med högst 50 000 vektorer konverteras
+  automatiskt vid uppstart; större med `08_konvertera_vektorer.py`.
+- `dk_sok_semantisk` hämtar de närmaste chunkarna med en indexvänlig fråga och
+  grupperar dem per dokument; `dk_sok_i_dokument` sorterar exakt inom
+  dokumentet utan att gå via indexet.
+- Retsinformation synkas fortsatt via harvest-API:et. ELI Atom-feeden som
+  Civilstyrelsen annonserat har ingen dokumenterad eller hittbar adress
+  (kontrollerat 2026-09-24); skälen står i `03_synka_retsinformation.py`.
+- **Inkrementell ODA-synk på `opdateringsdato`.** `02_synka_oda.py --fas 1`
+  hämtar ärenden som ändrats sedan förra lyckade körningen, inte bara ärenden
+  med högre id än förut. Ändrade ärenden (ny status, resume, afgørelse)
+  uppdateras därmed i databasen. Pagineringen sker på nyckel
+  (`opdateringsdato`, `id`) i stället för `$skip`, så att ett ärende som
+  uppdateras under körningen inte förskjuter sidorna. Checkpointen
+  (`oda_senaste_opdateringsdato`) flyttas bara fram när körningen lyckats;
+  vid fel avslutas skriptet med exitkod 1. `--full` hämtar alla ärenden,
+  `--sedan YYYY-MM-DD` ärenden ändrade sedan ett datum. Den första körningen
+  utan checkpoint är en full synk (cirka 100 000 ärenden, ungefär 1 000
+  anrop). Den tidigare nyckeln `oda_senaste_sagid` används inte längre.
+- `synk_daglig.sh` fortsätter med fulltext och embedding när ODA-steget
+  misslyckas, och loggar att checkpointen inte flyttades.
+- Titel och annotationer (`readOnlyHint`, `openWorldHint` m.fl.) på alla
+  verktyg, cachningshintar för verktygslistan och serverinstruktioner som
+  beskriver verktygskedjorna.
+- I http-läget laddas embeddingmodellen vid uppstart.
+
 ### Borttaget
 
+- Den odokumenterade `ocrmypdf`-reserven fanns aldrig i det här repot —
+  ingen ändring krävdes av den anledningen.
 - SSE-transporten (`/sse`, `/messages/`).
 
 ---
+
+### Ändrat
+
+- User-Agent-strängen följer huvudversionen: `mcp-for-folketinget-retsinformation/2.0`.
+- **Brytande: MCP Python SDK 2.x krävs** (`mcp>=2.0,<3`). Servern är
+  omskriven från lågnivå-`Server` med handskrivna scheman till `MCPServer`
+  med `@mcp.tool()`. Verktygsnamn, parametrar och beskrivningar är
+  oförändrade.
+- **Brytande: http-läget kör Streamable HTTP på `/mcp` och kräver
+  `MCP_API_KEY`.** Utan nyckel avbryts uppstarten med exitkod 2 i stället för
+  att servern startar oskyddad. Fel nyckel ger 403, saknad header 401.
+- **Brytande: förväntade fel är verktygsfel.** Okänt `dok_id`, `sagid` eller
+  `aktorid`, ODA som inte svarar, databasfel och semantisk sökning mot SQLite
+  ger nu `isError` med ett svenskt meddelande i stället för ett vanligt
+  textsvar. Klienter som tolkade feltexten som resultat behöver se över det.
+- **Brytande: `max_tecken` i `dk_hamta_dokument` har ett tak på 400 000
+  tecken**, och `0` betyder "så mycket som ryms" i stället för hela texten.
+  Svaret skickas nu både som JSON-text och som strukturerat innehåll, och
+  en hel lagtext på nära en miljon tecken skulle då spränga protokollets
+  gräns. Längre texter läses i flera anrop med `fran_tecken`.
+- Alla verktyg returnerar typade, strukturerade svar med utdataschema.
+  Textsvaret är samma JSON som förut. `dk_lista_perioder` ger en lista, som
+  skickas som ett textblock per period och strukturerat som `{"result": [...]}`;
+  `dk_hamta_dokument` och `dk_hamta_aktor`, som har två svarsformer, har
+  sitt strukturerade svar under `result`.
+- Verktygen körs på arbetstrådar i stället för att blockera servern, så att
+  flera anrop kan pågå samtidigt.
+- `requirements.txt` har versionsgränser.
 
 ## [1.2.0] — 2026-08-10
 

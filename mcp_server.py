@@ -104,7 +104,7 @@ PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _HTTPX_HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "mcp-for-folketinget-retsinformation/1.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
+    "User-Agent": "mcp-for-folketinget-retsinformation/2.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
 }
 
 _SQLITE_EJ_VEKTOR = (
@@ -618,7 +618,7 @@ mcp = MCPServer(
         "bär trunkerad, tecken_totalt och fortsatt_fran_tecken; citera aldrig ordagrant "
         "ur ett kapat svar utan att läsa vidare med fran_tecken."
     ),
-    version="1.2.0",
+    version="2.0.0",
     cache_hints=CACHE_HINTAR,
 )
 

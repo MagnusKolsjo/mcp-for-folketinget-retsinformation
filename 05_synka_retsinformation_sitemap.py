@@ -76,7 +76,7 @@ _TYPNAMN = {
 
 _XML_HEADERS = {
     "Accept": "application/xml, text/xml, */*",
-    "User-Agent": "mcp-for-folketinget-retsinformation/1.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
+    "User-Agent": "mcp-for-folketinget-retsinformation/2.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)",
 }
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ def _hamta_sitemap_urls(bara_lta: bool = False) -> list[str]:
     ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
     alla_urls = []
 
-    with httpx.Client(headers={"User-Agent": "mcp-for-folketinget-retsinformation/1.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)"}, timeout=30, follow_redirects=True) as klient:
+    with httpx.Client(headers={"User-Agent": "mcp-for-folketinget-retsinformation/2.0 (+https://github.com/MagnusKolsjo/mcp-for-folketinget-retsinformation)"}, timeout=30, follow_redirects=True) as klient:
         for sida in range(1, SITEMAP_SIDOR + 1):
             url = f"{SITEMAP_BAS}?page={sida}"
             try:
