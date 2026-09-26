@@ -81,9 +81,9 @@ ODA_BAS_URL = "https://oda.ft.dk/api"
 
 # Termexpansion är ett uttryckligt val: utan flaggan görs inga LLM-anrop.
 QUERY_EXPANSION_ENABLED  = os.getenv("QUERY_EXPANSION_ENABLED", "false").strip().lower() in ("1", "true", "ja", "yes")
-QUERY_EXPANSION_BASE_URL = os.getenv("QUERY_EXPANSION_BASE_URL", "http://localhost:11434/v1")
+QUERY_EXPANSION_BASE_URL = os.getenv("QUERY_EXPANSION_BASE_URL", "")
 QUERY_EXPANSION_API_KEY  = os.getenv("QUERY_EXPANSION_API_KEY", "ollama")
-QUERY_EXPANSION_MODEL    = os.getenv("QUERY_EXPANSION_MODEL", "llama3")
+QUERY_EXPANSION_MODEL    = os.getenv("QUERY_EXPANSION_MODEL", "")
 
 # Standardtak för fulltext i dk_hamta_dokument. Danska lagtexter och
 # betænkninger når nära en miljon tecken; anroparen kan höja taket upp
@@ -570,6 +570,9 @@ def _expandera_fraga(fraga: str) -> str:
     Expanderar en sökfråga till dansk parlamentarisk och juridisk terminologi
     via OpenAI-kompatibel LLM. Returnerar kommaseparerade söktermer (OR-logik).
     """
+    if not QUERY_EXPANSION_MODEL:
+        logger.warning("QUERY_EXPANSION_MODEL saknas i .env; termexpansionen hoppas över.")
+        return fraga
     prompt_vag = _SCRIPT_DIR / "prompts" / "expansion_prompt.txt"
     if not prompt_vag.exists():
         return fraga
@@ -578,7 +581,7 @@ def _expandera_fraga(fraga: str) -> str:
 
     try:
         import openai
-        klient = openai.OpenAI(base_url=QUERY_EXPANSION_BASE_URL, api_key=QUERY_EXPANSION_API_KEY)
+        klient = openai.OpenAI(base_url=QUERY_EXPANSION_BASE_URL or None, api_key=QUERY_EXPANSION_API_KEY)
         svar = klient.chat.completions.create(
             model=QUERY_EXPANSION_MODEL,
             messages=[
