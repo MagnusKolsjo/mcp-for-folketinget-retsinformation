@@ -160,6 +160,7 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Ändrat
 
+- Texterna är produktneutrala: README, konfigurationsexempel, kommentarer och äldre CHANGELOG-poster nämner MCP-klienten i stället för en viss klient.
 - User-Agent-strängen följer huvudversionen: `mcp-for-folketinget-retsinformation/2.0`.
 - **Brytande: MCP Python SDK 2.x krävs** (`mcp>=2.0,<3`). Servern är
   omskriven från lågnivå-`Server` med handskrivna scheman till `MCPServer`
